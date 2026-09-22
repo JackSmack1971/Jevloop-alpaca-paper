@@ -12,9 +12,8 @@ from pathlib import Path
 from .assets import classify_symbol
 from .battery import run_battery
 from .client import MockDecisionClient
-from .ladder import select_rung
 from .limits import Limits
-from .policy import compose_action
+from .reducer import TickIdentity, TickInput, reduce_tick
 from .state import RuntimeState, TradeTick, build_snapshot, observe_trades
 from .evidence import EvidenceContext, serialize_record
 
@@ -82,16 +81,15 @@ def main(argv: list[str] | None = None) -> int:
         decision_latency_monotonic_ms = round(
             (time.monotonic() - decision_started_monotonic) * 1000, 3
         )
-        action = compose_action(answers, snapshot, limits)
-        rung = select_rung(
-            risk_kill=False,
-            decision_late=False,
-            jev_down=False,
-            decision_confidence=answers["quote_environment"]["confidence"],
-            low_confidence_threshold=limits.low_confidence_threshold,
-            execution_health_score=answers["execution_health"]["score"],
-            execution_health_floor=limits.execution_health_floor,
-        )
+        decision = reduce_tick(TickInput(
+            identity=TickIdentity(
+                run_id=evidence.run_id, runtime_mode="simulation", data_source=evidence.data_source,
+                symbol=evidence.symbol, provider_route=meta["route"], provider_model=meta["model"],
+            ),
+            snapshot=snapshot, answers=answers, asset=hint, limits=limits,
+            decision_latency_ms=meta["latency_ms"],
+        ))
+        action, rung = decision.action, decision.rung
         record = {
             **evidence.fields(),
             "tick": i + 1,
@@ -116,6 +114,18 @@ def main(argv: list[str] | None = None) -> int:
             "action_reason": action.reason,
             "rung": rung.value,
             "execution": "simulation-no-broker",
+            "intentions": [
+                {"kind": effect.intent.kind, "side": effect.intent.side,
+                 "quantity": effect.intent.quantity, "limit_price": effect.intent.limit_price,
+                 "risk_ok": effect.risk.ok, "risk_veto": effect.risk.veto}
+                for effect in decision.effects
+            ],
+            "order_decisions": [
+                {"side": order.side, "quantity": order.quantity,
+                 "limit_price": order.limit_price, "risk_ok": order.risk.ok,
+                 "risk_veto": order.risk.veto}
+                for order in decision.order_decisions
+            ],
             "latency_ms": meta["latency_ms"],
             "route": meta["route"],
             "model": meta["model"],

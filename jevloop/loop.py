@@ -16,7 +16,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from .assets import AssetSpec, quantize_quantity, quantity_for_notional
+from .assets import AssetSpec, quantize_quantity
 from .battery import run_battery
 from .client import DecisionClientError, DecisionLateResponseError, DecisionSchemaError
 from .execution.alpaca import (
@@ -26,12 +26,12 @@ from .execution.alpaca import (
     UnknownOrderOutcome,
 )
 from .evidence import EvidenceContext, serialize_record
-from .ladder import Rung, select_rung
+from .ladder import Rung
 from .limits import Limits
-from .policy import KILL, PULL_QUOTES, QUOTE_BOTH_SIDES, QUOTE_WIDE, STAND_DOWN, WIDEN, compose_action, fallback_action
-from .pricing import bounded_quote_prices
+from .policy import compose_action
 from .preflight import FOREIGN_SESSION_ORDERS, paper_preflight
 from .risk import check as risk_check
+from .reducer import TickIdentity, TickInput, reduce_tick
 from .state import RuntimeState, TradeTick, build_snapshot, observe_trades, record_fill_slippage
 
 LOG_DIR = Path(os.getenv("JEV_LOOP_HOME", str(Path.home() / ".jev-loop")))
@@ -228,130 +228,50 @@ def _flatten_if_needed(alpaca, spec: AssetSpec, runtime: RuntimeState, *, dry: b
     return f"flatten not verified; broker position remains {runtime.inventory_qty}"
 
 
-def _submit_quote_side(
-    alpaca,
-    *,
-    spec: AssetSpec,
-    side: str,
-    qty: float,
-    price: float,
-    snapshot: dict,
-    limits: Limits,
-    decision_latency_ms: float | None,
-    session_open_orders: int,
-    runtime: RuntimeState,
-    pending_orders: dict[str, dict],
-    dry: bool,
-) -> tuple[str, dict | None]:
-    notional = qty * price
-    signed = notional if side == "buy" else -notional
-    projected = snapshot["inventory_usd"] + signed
-    verdict = risk_check(
-        snapshot,
-        notional,
-        limits,
-        api_error_streak=runtime.api_error_streak,
-        decision_latency_ms=decision_latency_ms,
-        session_open_orders=session_open_orders,
-        projected_inventory_usd=projected,
-    )
-    if not verdict.ok:
-        return f"{side} vetoed: {verdict.veto}", None
-    if dry:
-        return f"dry {side} {qty:g} @ {price:g}", None
-    try:
-        order = alpaca.submit_limit_order(side=side, qty=qty, limit_price=price, spec=spec)
-        runtime.orders_submitted += 1
-        if order.get("id"):
-            pending_orders[str(order["id"])] = {"side": side, "expected_price": price}
-        return f"submitted {side} {qty:g} @ {price:g} id={order.get('id')}", order
-    except (AlpacaAPIError, MarketClosedError) as exc:
-        runtime.orders_rejected += 1
-        return f"{side} submission failed: {exc}", None
-
-
-def _execute_action(
-    *,
-    alpaca,
-    spec: AssetSpec,
-    action,
-    snapshot: dict,
-    limits: Limits,
-    decision_latency_ms: float | None,
-    rest_counter: int,
-    runtime: RuntimeState,
-    pending_orders: dict[str, dict],
-    dry: bool,
-) -> tuple[str, int]:
-    if action.kind in {PULL_QUOTES, STAND_DOWN}:
-        count, error = _cancel_owned(alpaca, dry=dry)
-        return f"{action.kind}; canceled={count}" + (f"; cancel_error={error}" if error else ""), 0
-
-    if action.kind not in {QUOTE_BOTH_SIDES, QUOTE_WIDE, WIDEN}:
-        return action.kind, rest_counter
-
-    rest_counter += 1
-    owned = [] if dry else _owned_open_orders(alpaca)
-    if owned and rest_counter < limits.quote_rest_ticks:
-        return f"{action.kind}; resting {len(owned)} owned order(s)", rest_counter
-
-    canceled, cancel_error = _cancel_owned(alpaca, dry=dry)
-    if cancel_error:
-        return f"{action.kind}; requote blocked: {cancel_error}; canceled={canceled}", 0
-    wide = action.kind in {QUOTE_WIDE, WIDEN}
-    bid_px, ask_px = bounded_quote_prices(
-        mid=snapshot["mid"],
-        best_bid=snapshot["best_bid"],
-        best_ask=snapshot["best_ask"],
-        inventory_utilization=snapshot["inventory_utilization"] or 0.0,
-        limits=limits,
-        spec=spec,
-        wide=wide,
-    )
-    quote_notional = limits.quote_notional_usd
-    buy_qty = quantity_for_notional(quote_notional, bid_px, spec)
+def _apply_intentions(*, decision, alpaca, spec, runtime, pending_orders, dry):
+    """Runtime-only adapter from inert reducer intentions to Alpaca operations."""
+    if not dry and decision.identity.runtime_mode != "paper-real":
+        raise PermissionError("only paper-real decisions may reach the paper-order adapter")
     messages: list[str] = []
-    msg, buy_order = _submit_quote_side(
-        alpaca,
-        spec=spec,
-        side="buy",
-        qty=buy_qty,
-        price=bid_px,
-        snapshot=snapshot,
-        limits=limits,
-        decision_latency_ms=decision_latency_ms,
-        session_open_orders=0,
-        runtime=runtime,
-        pending_orders=pending_orders,
-        dry=dry,
-    )
-    messages.append(msg)
-    open_count = 1 if buy_order else 0
+    for effect in decision.effects:
+        intent = effect.intent
+        if intent.kind == "cancel_owned":
+            count, error = _cancel_owned(alpaca, dry=dry)
+            messages.append(f"canceled={count}" + (f"; cancel_error={error}" if error else ""))
+            if error:
+                return "; ".join(messages) + "; subsequent intentions blocked"
+        elif intent.kind == "flatten":
+            try:
+                messages.append(_flatten_if_needed(alpaca, spec, runtime, dry=dry))
+            except (AlpacaAPIError, MarketClosedError) as exc:
+                messages.append(f"flatten attempt failed or became ambiguous: {exc}")
+        elif intent.kind == "limit_order":
+            assert (
+                intent.side is not None
+                and intent.quantity is not None
+                and intent.limit_price is not None
+            )
+            if dry:
+                messages.append(f"dry {intent.side} {intent.quantity:g} @ {intent.limit_price:g}")
+                continue
+            try:
+                order = alpaca.submit_limit_order(
+                    side=intent.side, qty=intent.quantity, limit_price=intent.limit_price, spec=spec
+                )
+                runtime.orders_submitted += 1
+                if order.get("id"):
+                    pending_orders[str(order["id"])] = {
+                        "side": intent.side,
+                        "expected_price": intent.limit_price,
+                    }
+                messages.append(
+                    f"submitted {intent.side} {intent.quantity:g} @ {intent.limit_price:g} id={order.get('id')}"
+                )
+            except (AlpacaAPIError, MarketClosedError) as exc:
+                runtime.orders_rejected += 1
+                messages.append(f"{intent.side} submission failed: {exc}")
+    return "; ".join(messages) or f"{decision.action_name}; resting owned order(s)"
 
-    # Cash/spot invariant: never create a naked sell. Only quote inventory already held.
-    available_sell = max(0.0, snapshot["inventory_qty"])
-    sell_qty = quantize_quantity(min(quantity_for_notional(quote_notional, ask_px, spec), available_sell), spec)
-    if spec.min_order_size is not None and sell_qty < float(spec.min_order_size):
-        sell_qty = 0.0
-    if sell_qty > 0:
-        msg, _ = _submit_quote_side(
-            alpaca,
-            spec=spec,
-            side="sell",
-            qty=sell_qty,
-            price=ask_px,
-            snapshot=snapshot,
-            limits=limits,
-            decision_latency_ms=decision_latency_ms,
-            session_open_orders=open_count,
-            runtime=runtime,
-            pending_orders=pending_orders,
-            dry=dry,
-        )
-        messages.append(msg)
-    else:
-        messages.append("sell skipped: no broker-reconciled inventory")
-    return "; ".join(messages), 0
 
 
 def run(
@@ -563,83 +483,75 @@ def run(
                         "accepted_on_time" if answers is not None else "no_response"
                     )
 
-            action = None if decision_late else (fallback_action(snapshot, limits) if jev_down or answers is None else compose_action(answers, snapshot, limits))
-            hard = risk_check(
-                snapshot,
-                0.0,
-                limits,
-                api_error_streak=runtime.api_error_streak,
-                decision_latency_ms=meta.get("latency_ms"),
-                session_open_orders=0,
+            identity = TickIdentity(
+                run_id=_ACTIVE_EVIDENCE.run_id,
+                runtime_mode=_ACTIVE_EVIDENCE.runtime_mode,
+                data_source=_ACTIVE_EVIDENCE.data_source,
+                symbol=_ACTIVE_EVIDENCE.symbol,
+                provider_route=meta.get("route") or _ACTIVE_EVIDENCE.provider_route,
+                provider_model=meta.get("model") or _ACTIVE_EVIDENCE.provider_model,
             )
-            conf = answers.get("quote_environment", {}).get("confidence") if answers else None
-            execution_health = answers.get("execution_health", {}).get("score") if answers else None
-            rung = select_rung(
-                risk_kill=hard.kill or (action is not None and action.kind == KILL),
-                decision_late=decision_late,
-                jev_down=jev_down,
-                decision_confidence=conf,
-                low_confidence_threshold=limits.low_confidence_threshold,
-                execution_health_score=execution_health,
-                execution_health_floor=limits.execution_health_floor,
-                risk_ok=hard.ok,
+            owned_count = 0 if dry_execution else len(_owned_open_orders(alpaca))
+            decision = reduce_tick(
+                TickInput(
+                    identity=identity,
+                    snapshot=snapshot,
+                    answers=answers,
+                    asset=spec,
+                    limits=limits,
+                    api_error_streak=runtime.api_error_streak,
+                    decision_latency_ms=meta.get("latency_ms"),
+                    decision_late=decision_late,
+                    provider_down=jev_down,
+                    owned_open_orders=owned_count,
+                    rest_counter=rest_counter,
+                ),
+                compose=compose_action,
             )
-
-            if rung == Rung.KILL:
-                canceled, cancel_error = _cancel_owned(alpaca, dry=dry_execution)
-                if cancel_error:
-                    execution = (
-                        f"KILL; flatten blocked because cancellation could not be verified; "
-                        f"canceled={canceled}; cancel_error={cancel_error}; manual broker reconciliation required"
-                    )
-                else:
-                    try:
-                        execution = _flatten_if_needed(alpaca, spec, runtime, dry=dry_execution)
-                    except (AlpacaAPIError, MarketClosedError, UnknownOrderOutcome) as exc:
-                        execution = f"flatten attempt failed or became ambiguous: {exc}"
-                action_name = "KILL"
-            elif rung in {Rung.HOLD_LATE, Rung.HOLD_BLOCKED, Rung.RULES_ONLY} or action is None:
+            action, rung, action_name = decision.action, decision.rung, decision.action_name
+            rest_counter = decision.rest_counter
+            try:
+                execution = _apply_intentions(
+                    decision=decision,
+                    alpaca=alpaca,
+                    spec=spec,
+                    runtime=runtime,
+                    pending_orders=pending_orders,
+                    dry=dry_execution,
+                )
+                if rung == Rung.HOLD_BLOCKED:
+                    execution = f"risk veto: {decision.risk.veto}; " + execution
+                elif rung in {Rung.HOLD_LATE, Rung.RULES_ONLY}:
+                    execution = "no new orders; " + execution
+            except UnknownOrderOutcome as exc:
                 count, error = _cancel_owned(alpaca, dry=dry_execution)
-                execution = f"no new orders; canceled={count}" + (f"; cancel_error={error}" if error else "")
-                if rung == Rung.HOLD_LATE:
-                    action_name = "HOLD_LATE"
-                elif rung == Rung.HOLD_BLOCKED:
-                    action_name = "RISK_BLOCK"
-                    execution = f"risk veto: {hard.veto}; " + execution
-                else:
-                    action_name = action.kind if action else "STAND_DOWN"
-            else:
-                effective_limits = limits
-                if rung == Rung.REDUCE:
-                    from dataclasses import replace
-                    effective_limits = replace(limits, quote_notional_usd=limits.quote_notional_usd * limits.reduce_size_factor)
                 try:
-                    execution, rest_counter = _execute_action(
-                        alpaca=alpaca,
-                        spec=spec,
-                        action=action,
-                        snapshot=snapshot,
-                        limits=effective_limits,
-                        decision_latency_ms=meta.get("latency_ms"),
-                        rest_counter=rest_counter,
-                        runtime=runtime,
-                        pending_orders=pending_orders,
-                        dry=dry_execution,
+                    _sync_account(alpaca, runtime, time.time())
+                except AlpacaAPIError as sync_exc:
+                    error = (
+                        f"{error}; account_sync={sync_exc}" if error else f"account_sync={sync_exc}"
                     )
-                    action_name = action.kind
-                except UnknownOrderOutcome as exc:
-                    count, error = _cancel_owned(alpaca, dry=dry_execution)
-                    try:
-                        _sync_account(alpaca, runtime, time.time())
-                    except AlpacaAPIError as sync_exc:
-                        error = f"{error}; account_sync={sync_exc}" if error else f"account_sync={sync_exc}"
-                    rung = Rung.HOLD_BLOCKED
-                    action_name = "UNKNOWN_ORDER_OUTCOME"
-                    execution = f"{exc}; canceled={count}" + (f"; reconciliation_error={error}" if error else "")
-                    record = _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=action_name)
-                    _persist(record, recent_records, spec.symbol, started_at)
-                    print(f"tick {block}: {action_name} | rung={rung.value} | {execution}")
-                    return 3
+                rung = Rung.HOLD_BLOCKED
+                action_name = "UNKNOWN_ORDER_OUTCOME"
+                execution = f"{exc}; canceled={count}" + (
+                    f"; reconciliation_error={error}" if error else ""
+                )
+                record = _record(
+                    block,
+                    now,
+                    spec,
+                    snapshot,
+                    answers,
+                    meta,
+                    action,
+                    rung,
+                    execution,
+                    runtime,
+                    action_name=action_name,
+                )
+                _persist(record, recent_records, spec.symbol, started_at)
+                print(f"tick {block}: {action_name} | rung={rung.value} | {execution}")
+                return 3
 
             record = _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=action_name)
             _persist(record, recent_records, spec.symbol, started_at)
