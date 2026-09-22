@@ -24,6 +24,7 @@ Priority is `KILL > HOLD_LATE > HOLD_BLOCKED > RULES_ONLY > REDUCE > RUN`.
 ## Broker/execution invariants
 
 - Runtime is Alpaca **paper-only** and CLI execution is dry by default; `--paper` is explicit.
+- `run --paper` must receive a ready result from the canonical `paper_preflight()` before paper authority is active or any order can be submitted. `doctor` independently displays that same result for inspection; it is not the mechanism that authorizes a later run.
 - Never cancel account-wide orders.
 - Every attempted order receives a unique session `client_order_id`; Alpaca's duplicate-client-ID behavior is used as an identity/reconciliation aid, not as permission to blind-retry POSTs.
 - On transport/5xx ambiguity, query `GET /v2/orders:by_client_order_id`. If the outcome remains unknown, stop fail-closed.
@@ -34,6 +35,7 @@ Priority is `KILL > HOLD_LATE > HOLD_BLOCKED > RULES_ONLY > REDUCE > RUN`.
 - Pre-existing inventory with unknown holding age is not assigned an invented age; it blocks new exposure until independently reconciled.
 - `TERMINAL_ORDER_STATES` in `jevloop/execution/alpaca.py` is `{filled, canceled, expired, rejected}` only. `done_for_day` is deliberately excluded: current Alpaca order-status documentation and support guidance describe it as "the order is done executing for the day, and will not receive further updates until the next trading day" -- a same-day pause, not closure. An earlier revision treated `done_for_day` as terminal, which discarded ownership tracking, dropped the order from cancellation candidates, and stopped polling it one trading day too early. `loop.py`'s `_refresh_order_statuses` and `_wait_terminal` import the same constant rather than redefining it, so the three call sites cannot drift out of sync again.
 - Order ownership (`_owned_client_order_ids`, and `client_order_id` prefix matching) is scoped to the current process's random session ID, by design: the runtime must never auto-cancel an order it cannot positively identify as its own. The cost of that design is that a session which ends without a clean shutdown (killed, crashed, host restart) leaves its resting orders invisible to every later session's automatic reconciliation. `AlpacaClient.get_foreign_session_open_orders()` is a read-only check (surfaced by `doctor` and at `run` startup) that lists jevloop-prefixed open orders that do not belong to the current session, so an operator is told about the gap instead of it being silent. It never cancels those orders; that stays a manual/operator decision.
+- Foreign-session orders make paper preflight not ready. Dry execution remains available and emits a structured warning containing the stable reason code and order IDs, without submitting or canceling anything.
 
 ## Market-state freshness
 

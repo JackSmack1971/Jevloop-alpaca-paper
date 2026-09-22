@@ -5,8 +5,8 @@ import argparse
 import os
 
 from .battery import run_battery
-from .client import DecisionClientError, resolve_decision_client
-from .execution.alpaca import AlpacaAPIError, AlpacaConfigError, client_from_env
+from .client import DecisionClientError
+from .preflight import paper_preflight
 
 
 def _probe_state() -> dict:
@@ -59,38 +59,27 @@ def main(argv: list[str] | None = None) -> int:
         print("  Jev provider: UNVERIFIED_RUNTIME (--offline)")
         return 0
 
-    try:
-        alpaca = client_from_env(symbol=args.symbol, live=False)
-        spec = alpaca.load_asset_spec()
-        account = alpaca.get_account()
-        market_open = alpaca.is_market_open(spec)
+    result = paper_preflight(symbol=args.symbol, mock=args.mock)
+    if result.asset is not None:
+        spec = result.asset
         print(
             f"  broker asset: OK symbol={spec.symbol} class={spec.asset_class} "
             f"status={spec.status} tradable={spec.tradable} source={spec.metadata_source}"
         )
-        blocked = bool(account.get("trading_blocked"))
-        print(f"  paper account: OK status={account.get('status')} trading_blocked={blocked}")
-        if blocked:
-            print("  broker: BLOCKED: account reports trading_blocked=true")
-            return 2
-        print(f"  session: {'open/24x7' if market_open else 'closed'}")
-        foreign = alpaca.get_foreign_session_open_orders()
-        if foreign:
-            ids = [str(o.get("id")) for o in foreign]
-            print(
-                f"  prior-session orders: NOTICE {len(foreign)} open order(s) from a different "
-                f"jev-loop session remain open (ids={ids}); a new run's automatic cancellation is "
-                "scoped to its own session and will not touch them -- reconcile manually before "
-                "relying on session-owned cancellation to clear the account"
-            )
-        else:
-            print("  prior-session orders: none found")
-    except (AlpacaConfigError, AlpacaAPIError, ValueError) as exc:
-        print(f"  broker: BLOCKED: {exc}")
+    if result.account is not None:
+        print(
+            f"  paper account: status={result.account.get('status')} "
+            f"trading_blocked={bool(result.account.get('trading_blocked'))}"
+        )
+    for reason in result.reasons:
+        print(f"  preflight: BLOCKED code={reason.code} message={reason.message}")
+    if not result.ready:
+        print("PREFLIGHT_BLOCKED")
         return 2
 
     try:
-        client = resolve_decision_client(mock=args.mock)
+        client = result.decision_client
+        assert client is not None
         answers, meta = run_battery(client, _probe_state(), timeout=5.0)
         print(
             f"  decision provider: OK route={meta.get('route')} model={meta.get('model')} "
