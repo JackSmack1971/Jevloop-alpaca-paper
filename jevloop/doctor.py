@@ -5,7 +5,7 @@ import argparse
 import os
 
 from .battery import run_battery
-from .client import DecisionClientError
+from .client import DecisionClientError, DecisionSchemaError
 from .preflight import paper_preflight
 
 
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if client.name == "MOCK":
             print("  note: mock proves local wiring only; it is not valid for broker-order execution")
-    except (DecisionClientError, ValueError, KeyError, TypeError) as exc:
+    except (DecisionClientError, DecisionSchemaError) as exc:
         print(f"  decision provider: BLOCKED: {exc}")
         return 2
 

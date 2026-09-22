@@ -1,5 +1,12 @@
+import json
+import time
+from decimal import Decimal
+
+from jevloop.assets import AssetSpec
+from jevloop.execution.alpaca import MarketView
 from jevloop.limits import Limits
-from jevloop.loop import _refresh_order_statuses, _sync_account
+from jevloop.loop import _refresh_order_statuses, _sync_account, run
+from jevloop.preflight import PaperPreflightResult
 from jevloop.risk import check
 from jevloop.state import RuntimeState
 
@@ -79,3 +86,72 @@ def test_cancel_verification_reports_remaining_owned_orders(monkeypatch):
     count, error = _cancel_owned(Broker(), dry=False, verify_attempts=2)
     assert count == 1
     assert "still open" in error
+
+
+def test_malformed_decision_cancels_and_verifies_without_submitting(monkeypatch, tmp_path):
+    class MalformedProvider:
+        name = "malformed-provider"
+        model = "test-model"
+
+        def ask(self, **kwargs):
+            return {"direction": "not-an-answer-mapping"}, {"latency_ms": 1.0}
+
+    class Broker:
+        session_id = "current"
+
+        def __init__(self):
+            self.cancel_calls = 0
+            self.open_orders = [{"id": "owned-1", "client_order_id": "jevloop-current-1"}]
+            self.submit_calls = 0
+
+        def get_account(self):
+            return {"equity": "10000", "last_equity": "10000"}
+
+        def get_position(self):
+            return None
+
+        def get_market_view(self, spec):
+            now = time.time()
+            return MarketView(99.99, 100.01, [(99.99, 1)], [(100.01, 1)], [], now)
+
+        def cancel_session_orders(self):
+            self.cancel_calls += 1
+            cancelled = [order["id"] for order in self.open_orders]
+            self.open_orders = []
+            return cancelled
+
+        def get_open_orders(self):
+            return list(self.open_orders)
+
+        @staticmethod
+        def is_owned_order(order, session_id):
+            return order["client_order_id"].startswith(f"jevloop-{session_id}-")
+
+        def submit_limit_order(self, **kwargs):
+            self.submit_calls += 1
+            raise AssertionError("malformed decisions must never submit an order")
+
+    broker = Broker()
+    spec = AssetSpec(
+        "BTC/USD", "crypto", True, True, status="active", tradable=True,
+        min_order_size=Decimal("0.0001"), min_trade_increment=Decimal("0.0001"),
+        price_increment=Decimal("0.01"), metadata_source="alpaca:/v2/assets",
+    )
+    result = PaperPreflightResult((), broker, spec, broker.get_account(), MalformedProvider())
+    monkeypatch.setattr("jevloop.loop.paper_preflight", lambda **kwargs: result)
+    monkeypatch.setattr("jevloop.loop.LOG_DIR", tmp_path)
+    monkeypatch.setattr("jevloop.loop.LOG_FILE", tmp_path / "log.jsonl")
+    monkeypatch.setattr("jevloop.loop.LATEST_FILE", tmp_path / "latest.json")
+
+    assert run(
+        symbol="BTC/USD", ticks=1, mock=False, dry_execution=False,
+        limits=Limits(tick_seconds=0),
+    ) == 0
+
+    record = json.loads((tmp_path / "log.jsonl").read_text().strip())
+    assert record["rung"] == "rules_only"
+    assert record["action"] == "STAND_DOWN"
+    assert "no new orders" in record["execution"]
+    assert broker.cancel_calls == 1
+    assert broker.open_orders == []
+    assert broker.submit_calls == 0
