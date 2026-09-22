@@ -66,8 +66,19 @@ def main() -> int:
         fail("SKILL.md missing inconclusive runtime status", errors)
 
     openai_meta = (ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
-    if "allow_implicit_invocation: false" not in openai_meta:
-        fail("agents/openai.yaml must require explicit invocation for operational side effects", errors)
+    if not re.search(r"^\s*allow_implicit_invocation:\s*true\s*$", openai_meta, re.MULTILINE):
+        fail("agents/openai.yaml must allow implicit routing", errors)
+    # Skill activation selects this workflow; it is not paper-effect authorization.
+    # Keep each independent authorization gate visible in the package contract.
+    authorization_gates = {
+        "explicit user intent": "user's explicit intent",
+        "paper CLI flag": "`--paper`",
+        "canonical paper preflight": "ready canonical paper preflight",
+        "environment policy": "environment policy",
+    }
+    for gate, marker in authorization_gates.items():
+        if marker not in skill:
+            fail(f"SKILL.md missing paper authorization gate: {gate}", errors)
 
     # Every branch-specific reference named by SKILL must exist.
     for ref in re.findall(r"`(references/[^`]+\.md)`", skill):
@@ -127,9 +138,20 @@ def main() -> int:
             fail(f"{filename} has {len(rows)} rows; expected >= {minimum}", errors)
     routing = ROOT / "evals" / "routing.jsonl"
     if routing.exists():
-        labels = [json.loads(x)["expected"] for x in routing.read_text(encoding="utf-8").splitlines() if x.strip()]
+        routing_rows = [json.loads(x) for x in routing.read_text(encoding="utf-8").splitlines() if x.strip()]
+        labels = [row["expected"] for row in routing_rows]
         if labels.count("activate") < 20 or labels.count("do_not_activate") < 20 or labels.count("neighbor") < 10:
             fail("routing corpus does not meet 20/20/10 class minimums", errors)
+        required_cases = {
+            "implicit-positive": "activate",
+            "explicit-positive": "activate",
+            "general-investing-negative": "do_not_activate",
+            "live-money-negative": "do_not_activate",
+            "neighbor-task": "neighbor",
+        }
+        for case, expected in required_cases.items():
+            if not any(row.get("case") == case and row.get("expected") == expected for row in routing_rows):
+                fail(f"routing corpus missing {case} case labeled {expected}", errors)
 
     # The broker implementation must preserve the main safety invariants as source contracts.
     alpaca = (ROOT / "jevloop/execution/alpaca.py").read_text(encoding="utf-8")

@@ -118,7 +118,7 @@ Open `http://127.0.0.1:8765/`. The server exposes only `latest.json` plus bundle
 ## Package map
 
 - `SKILL.md` — concise Codex workflow and invariants.
-- `agents/openai.yaml` — interface metadata and explicit-invocation policy.
+- `agents/openai.yaml` — interface metadata and implicit-routing policy; runtime gates authorize paper effects separately.
 - `jevloop/` — runtime implementation.
 - `tests/` — deterministic offline regression tests.
 - `references/` — progressive provider, architecture/safety, evaluation, research, and live-boundary detail.

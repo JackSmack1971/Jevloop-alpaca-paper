@@ -5,7 +5,7 @@ Every package file was re-inspected in the 0.3.0 pass. Unchanged files were reta
 | Area/file | 0.3.0 disposition | Material reason |
 |---|---|---|
 | `SKILL.md` | Tightened | Shorter progressive-disclosure workflow; explicit Skill≠authority boundary; dry-by-default/paper-explicit invariants; new `HOLD_BLOCKED`; no live runtime. |
-| `agents/openai.yaml` | Hardened | `allow_implicit_invocation=false` because operational activation can lead to paper broker side effects. |
+| `agents/openai.yaml` | Hardened | `allow_implicit_invocation=true` for discoverability; activation remains separate from explicit paper-effect authorization. |
 | `README.md` | Rewritten | Matches actual paper-only runtime, dry default, reconciliation behavior, updated calibration semantics, uv lock guidance. |
 | `.env.example` | Tightened | Paper credentials only; no live enablement concept. |
 | `pyproject.toml` / `jevloop.__version__` | Updated | Version 0.3.0; dev tooling moved to PEP 735-style dependency group used by current uv. |
