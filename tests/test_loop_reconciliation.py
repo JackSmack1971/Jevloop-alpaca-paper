@@ -5,12 +5,82 @@ from decimal import Decimal
 import pytest
 
 from jevloop.assets import AssetSpec
+from jevloop.authority import AuthorityState, InvalidAuthorityTransition, PaperAuthority, TransitionReason
 from jevloop.execution.alpaca import MarketView
 from jevloop.limits import Limits
 from jevloop.loop import _refresh_order_statuses, _sync_account, run
 from jevloop.preflight import PaperPreflightResult
 from jevloop.risk import check
 from jevloop.state import RuntimeState
+
+
+def _active_authority():
+    authority = PaperAuthority()
+    authority.transition(AuthorityState.PAPER_READY, TransitionReason("PREFLIGHT_READY", "ready"))
+    authority.broker_reconcile(lambda: [], lambda: None)
+    return authority
+
+
+def test_authority_transitions_are_explicit_and_validated():
+    authority = _active_authority()
+    assert authority.state is AuthorityState.PAPER_ACTIVE
+    assert authority.reason.code == "BROKER_STATE_RECONCILED"
+
+    authority.require_reconciliation("STREAM_GAP", "future stream sequence gap")
+    assert authority.state is AuthorityState.RECONCILIATION_REQUIRED
+    with pytest.raises(InvalidAuthorityTransition):
+        authority.transition(AuthorityState.PAPER_READY, TransitionReason("BAD", "invalid recovery"))
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        AuthorityState.NO_AUTHORITY,
+        AuthorityState.PAPER_READY,
+        AuthorityState.RECONCILIATION_REQUIRED,
+        AuthorityState.HALTED,
+    ],
+)
+def test_no_unresolved_authority_state_can_submit(state):
+    authority = PaperAuthority()
+    if state is AuthorityState.PAPER_READY:
+        authority.transition(state, TransitionReason("READY", "not active"))
+    elif state is AuthorityState.RECONCILIATION_REQUIRED:
+        authority.transition(AuthorityState.PAPER_READY, TransitionReason("READY", "ready"))
+        authority.require_reconciliation("AMBIGUOUS_SUBMISSION", "unknown outcome")
+    elif state is AuthorityState.HALTED:
+        authority.transition(state, TransitionReason("STOP", "stopped"))
+
+    called = False
+    def submission():
+        nonlocal called
+        called = True
+
+    with pytest.raises(PermissionError, match=f"authority={state.value}"):
+        authority.submit(submission)
+    assert called is False
+
+
+def test_reconciliation_requires_fresh_owned_order_and_position_reads():
+    authority = _active_authority()
+    authority.require_reconciliation("CANCELLATION_UNVERIFIED", "verification failed")
+    reads = []
+
+    with pytest.raises(RuntimeError, match="position unreadable"):
+        authority.broker_reconcile(
+            lambda: reads.append("orders") or [],
+            lambda: (_ for _ in ()).throw(RuntimeError("position unreadable")),
+        )
+    assert reads == ["orders"]
+    assert authority.state is AuthorityState.RECONCILIATION_REQUIRED
+    assert authority.reason.code == "BROKER_STATE_UNREADABLE"
+
+    authority.broker_reconcile(
+        lambda: reads.append("orders") or [],
+        lambda: reads.append("position") or None,
+    )
+    assert reads == ["orders", "orders", "position"]
+    assert authority.state is AuthorityState.PAPER_ACTIVE
 
 
 class FakeBroker:
