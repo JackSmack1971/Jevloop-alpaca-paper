@@ -1,11 +1,14 @@
 import pytest
+import requests
 from jevloop.battery import build_questions, run_battery, validate_answers
 from jevloop.client import (
     DecisionClientError,
+    DecisionLateResponseError,
     DecisionSchemaError,
     MockDecisionClient,
     TypeSafeDirectClient,
     resolve_decision_client,
+    _post,
 )
 from jevloop.split import SplitViolation, assert_split_respected, render_split_table
 
@@ -61,7 +64,7 @@ def _valid_answers():
 
 @pytest.mark.parametrize("payload", [None, 3, [], "response"])
 def test_provider_outer_response_must_be_mapping(monkeypatch, payload):
-    monkeypatch.setattr("jevloop.client._post", lambda *args, **kwargs: payload)
+    monkeypatch.setattr("jevloop.client._post", lambda *args, **kwargs: (payload, 0.01))
     with pytest.raises(DecisionSchemaError, match="response must be a mapping"):
         TypeSafeDirectClient("secret", "model").ask({}, build_questions(), 1)
 
@@ -148,3 +151,94 @@ def test_direct_provider_requires_explicit_model(monkeypatch):
 def test_mock_requires_explicit_flag(monkeypatch):
     monkeypatch.delenv("TYPESAFE_API_KEY",raising=False); monkeypatch.delenv("AI_GATEWAY_API_KEY",raising=False)
     assert resolve_decision_client(mock=True).name=="MOCK"
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class _Response:
+    status_code = 200
+    headers = {}
+    text = ""
+
+    def __init__(self, payload=None):
+        self.payload = payload or {"answers": {}}
+
+    def json(self):
+        return self.payload
+
+
+def test_post_rejects_success_returned_after_total_deadline(monkeypatch):
+    clock = _Clock()
+
+    def post(*args, **kwargs):
+        clock.advance(1.01)
+        return _Response({"ok": True})
+
+    monkeypatch.setattr("jevloop.client.requests.post", post)
+    with pytest.raises(DecisionLateResponseError) as raised:
+        _post("https://example.test", {}, {}, 1.0, monotonic=clock.monotonic)
+    assert raised.value.configured_deadline_s == 1.0
+    assert raised.value.measured_latency_ms == 1010.0
+    assert raised.value.disposition == "rejected_late_response"
+
+
+def test_post_retry_exhaustion_uses_total_clock(monkeypatch):
+    clock = _Clock()
+    calls = 0
+
+    def post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        clock.advance(0.1)
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr("jevloop.client.requests.post", post)
+    monkeypatch.setattr("jevloop.client.random.uniform", lambda *_: 0.0)
+    with pytest.raises(DecisionClientError, match="transport failure"):
+        _post(
+            "https://example.test", {}, {}, 10.0,
+            monotonic=clock.monotonic, sleep=clock.advance,
+        )
+    assert calls == 3
+    assert clock.now == pytest.approx(1.05)
+
+
+def test_post_rejects_backoff_that_would_cross_deadline(monkeypatch):
+    clock = _Clock()
+
+    def post(*args, **kwargs):
+        clock.advance(0.8)
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr("jevloop.client.requests.post", post)
+    monkeypatch.setattr("jevloop.client.random.uniform", lambda *_: 0.0)
+    with pytest.raises(DecisionLateResponseError, match="retry backoff") as raised:
+        _post(
+            "https://example.test", {}, {}, 1.0,
+            monotonic=clock.monotonic, sleep=clock.advance,
+        )
+    assert raised.value.measured_latency_ms == 800.0
+
+
+def test_post_accepts_on_time_success_and_reports_total_latency(monkeypatch):
+    clock = _Clock()
+
+    def post(*args, **kwargs):
+        clock.advance(0.4)
+        return _Response({"ok": True})
+
+    monkeypatch.setattr("jevloop.client.requests.post", post)
+    payload, latency_s = _post(
+        "https://example.test", {}, {}, 1.0, monotonic=clock.monotonic
+    )
+    assert payload == {"ok": True}
+    assert latency_s == pytest.approx(0.4)

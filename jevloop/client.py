@@ -17,13 +17,28 @@ TYPESAFE_DIRECT_URL = "https://api.typesafe.ai/v1/systemone"
 GATEWAY_URL = "https://ai-gateway.vercel.sh/typesafe/v1/systemone"
 RETRYABLE = {429, 500, 502, 503, 504, 529}
 # ~3.05s is slightly above the default TCP retransmission window (Requests' own
-# documented rationale for connect timeouts); bounds a hung connect attempt without
-# shortening how long we wait for an already-connected, slow-to-respond read.
+# documented rationale for connect timeouts). This is a socket inactivity limit,
+# not transport-level cancellation or a hard wall-clock deadline.
 _CONNECT_TIMEOUT_S = 3.05
 
 
 class DecisionClientError(RuntimeError):
     pass
+
+
+class DecisionLateResponseError(DecisionClientError):
+    """A decision operation completed or was about to retry after its deadline."""
+
+    disposition = "rejected_late_response"
+
+    def __init__(self, message: str, *, configured_deadline_s: float, measured_latency_s: float):
+        super().__init__(message)
+        self.configured_deadline_s = configured_deadline_s
+        self.measured_latency_s = measured_latency_s
+
+    @property
+    def measured_latency_ms(self) -> float:
+        return round(self.measured_latency_s * 1000, 3)
 
 
 class DecisionSchemaError(RuntimeError):
@@ -51,27 +66,61 @@ class BaseDecisionClient:
         raise NotImplementedError
 
 
-def _post(url: str, headers: dict, body: dict, timeout: float) -> dict:
-    deadline = time.monotonic() + timeout
+def _post(
+    url: str,
+    headers: dict,
+    body: dict,
+    timeout: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> tuple[dict, float]:
+    """POST with retries and a measured total deadline.
+
+    Requests timeouts limit socket inactivity; they cannot interrupt the transport at
+    an exact wall-clock instant. The monotonic check after every returned request
+    rejects a payload that arrived too late, while the injected clock makes all
+    deadline paths deterministic under test.
+    """
+    started = monotonic()
+    deadline = started + timeout
+
+    def elapsed() -> float:
+        return monotonic() - started
+
+    def late(message: str) -> DecisionLateResponseError:
+        return DecisionLateResponseError(
+            message, configured_deadline_s=timeout, measured_latency_s=elapsed()
+        )
+
     for attempt in range(3):
-        remaining = deadline - time.monotonic()
+        remaining = deadline - monotonic()
         if remaining <= 0:
-            raise DecisionClientError("decision deadline exceeded")
+            raise late("decision deadline exceeded")
         try:
             read_timeout = min(remaining, 5.0)
             resp = requests.post(
                 url, headers=headers, json=body, timeout=(min(_CONNECT_TIMEOUT_S, read_timeout), read_timeout)
             )
         except requests.RequestException as exc:
+            if monotonic() >= deadline:
+                raise late("decision deadline exceeded after transport attempt") from exc
             if attempt == 2:
                 raise DecisionClientError(f"decision transport failure: {exc}") from exc
             resp = None
         if resp is not None:
+            # Check before status, JSON decoding, or accepting any provider payload.
+            if monotonic() >= deadline:
+                raise late("decision response arrived after deadline")
             if resp.status_code == 200:
                 try:
-                    return resp.json()
+                    data = resp.json()
                 except ValueError as exc:
                     raise DecisionClientError("decision provider returned invalid JSON") from exc
+                # JSON decoding is part of the caller's total decision budget too.
+                if monotonic() >= deadline:
+                    raise late("decision payload decoded after deadline")
+                return data, elapsed()
             if resp.status_code not in RETRYABLE:
                 raise DecisionClientError(f"decision HTTP {resp.status_code}: {resp.text[:240]}")
             retry_after = resp.headers.get("Retry-After")
@@ -82,9 +131,9 @@ def _post(url: str, headers: dict, body: dict, timeout: float) -> dict:
         else:
             delay = 0.25 * (2 ** attempt)
         delay += random.uniform(0, 0.05)
-        if time.monotonic() + delay >= deadline:
-            raise DecisionClientError("decision deadline exceeded during retry backoff")
-        time.sleep(delay)
+        if monotonic() + delay >= deadline:
+            raise late("decision deadline exceeded during retry backoff")
+        sleep(delay)
     raise DecisionClientError("decision request failed")
 
 
@@ -94,11 +143,14 @@ class TypeSafeDirectClient(BaseDecisionClient):
         self.api_key = api_key
     def ask(self, state: dict, questions: dict, timeout: float) -> tuple[dict, dict]:
         t0 = time.monotonic()
-        data = _post(TYPESAFE_DIRECT_URL, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                     {"state": state, "model": self.model, "questions": questions}, timeout)
+        data, latency_s = _post(TYPESAFE_DIRECT_URL, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                                {"state": state, "model": self.model, "questions": questions}, timeout)
         answers, response_meta = _response_parts(data, default_model=self.model)
         return answers, {"route": self.name, **response_meta,
-                         "latency_ms": round((time.monotonic()-t0)*1000, 2)}
+                         "latency_ms": round((time.monotonic()-t0)*1000, 2),
+                         "decision_deadline_s": timeout,
+                         "decision_transport_latency_ms": round(latency_s * 1000, 3),
+                         "late_response_disposition": "accepted_on_time"}
 
 
 class GatewayClient(BaseDecisionClient):
@@ -107,11 +159,14 @@ class GatewayClient(BaseDecisionClient):
         self.api_key = api_key
     def ask(self, state: dict, questions: dict, timeout: float) -> tuple[dict, dict]:
         t0 = time.monotonic()
-        data = _post(GATEWAY_URL, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                     {"state": state, "model": self.model, "questions": questions}, timeout)
+        data, latency_s = _post(GATEWAY_URL, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                                {"state": state, "model": self.model, "questions": questions}, timeout)
         answers, response_meta = _response_parts(data, default_model=self.model)
         return answers, {"route": self.name, **response_meta,
-                         "latency_ms": round((time.monotonic()-t0)*1000, 2)}
+                         "latency_ms": round((time.monotonic()-t0)*1000, 2),
+                         "decision_deadline_s": timeout,
+                         "decision_transport_latency_ms": round(latency_s * 1000, 3),
+                         "late_response_disposition": "accepted_on_time"}
 
 
 class MockDecisionClient(BaseDecisionClient):

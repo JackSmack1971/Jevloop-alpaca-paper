@@ -34,8 +34,8 @@ TERMINAL_ORDER_STATES = {"filled", "canceled", "expired", "rejected"}
 # It stays tracked, stays a cancellation candidate, and keeps being polled.
 PAUSED_UNTIL_NEXT_SESSION_STATES = {"done_for_day"}
 # A connect timeout of ~3.05s (slightly above the default TCP retransmission window)
-# bounds how long a hung connection attempt can block a single call; the read timeout
-# stays fully configurable via `timeout_s` so slow-but-live responses are not cut off.
+# is a socket inactivity limit, not hard cancellation. The read timeout stays fully
+# configurable via `timeout_s` so slow-but-live responses are not cut off.
 _CONNECT_TIMEOUT_S = 3.05
 
 
