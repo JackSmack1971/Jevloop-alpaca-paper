@@ -1,9 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "codex_version": "REQUIRED",
   "model": "REQUIRED",
-  "repetitions": 3,
   "timeout_seconds": 900,
-  "cases_file": "cases.jsonl",
-  "variants": ["with_skill", "without_skill"]
+  "suites": {
+    "routing": {"file": "routing.jsonl", "repetitions": 3, "conditions": ["with_skill"]},
+    "task": {"file": "tasks.jsonl", "repetitions": 5, "conditions": ["with_skill", "without_skill"]},
+    "failure": {"file": "failures.jsonl", "repetitions": 5, "conditions": ["with_skill", "without_skill"]}
+  }
 }

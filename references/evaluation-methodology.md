@@ -2,6 +2,29 @@
 
 Load this for calibration, threshold tuning, performance claims, or strategy comparisons.
 
+## Codex skill evaluation protocol
+
+Skill evaluation uses three independent corpora rather than a hand-selected combined
+case file. The routing suite contains 50 prompts (20 positive, 20 negative, and 10
+neighboring) repeated three times with the skill installed. The 10 task and 5 failure
+scenarios are each repeated five times in both treatment and baseline conditions. The
+result is exactly 150 routing, 100 task, and 50 failure trials.
+
+Every treatment trial installs the complete audited skill under
+`.agents/skills/jev-loop/`; every baseline starts at the same commit without that
+path. Records identify suite, scenario, repetition, condition, commit, pinned model,
+pinned Codex version, skill path, and content digest. Runtime activation is credited
+only when Codex emits an explicit activation event. Otherwise its status is
+`inconclusive`; behavioral reference selection is reported independently and cannot
+stand in for activation telemetry.
+
+The report includes command and tool-call counts. Efficiency comparisons use only
+successful task/failure runs and report treatment divided by baseline mean token,
+command, and wall-clock use. Null is the honest result when either successful cohort
+has no observations or a denominator is zero. The dry `python evals/run.py --list`
+manifest and deterministic tests must show exactly 300 trials without invoking Codex
+before an external evaluation is authorized.
+
 ## Probability quality
 
 - Evaluate the probability vector from the exact answer under study; never substitute another answer's confidence.
