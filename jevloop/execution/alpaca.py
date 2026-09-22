@@ -4,6 +4,7 @@ The packaged runtime is paper-only. Live-money authority is deliberately absent:
 behavioral instructions can request safer behavior, but they cannot substitute for
 an executable capability boundary.
 """
+
 from __future__ import annotations
 
 import os
@@ -14,7 +15,13 @@ from urllib.parse import quote
 
 import requests
 
-from ..assets import AssetSpec, classify_symbol, from_alpaca_asset, require_tradable
+from ..assets import (
+    AssetSpec,
+    alpaca_order_query_symbol,
+    classify_symbol,
+    from_alpaca_asset,
+    require_tradable,
+)
 from ..state import TradeTick, parse_rfc3339
 from ..evidence import PROCESS_RUN_ID
 
@@ -37,6 +44,7 @@ PAUSED_UNTIL_NEXT_SESSION_STATES = {"done_for_day"}
 # is a socket inactivity limit, not hard cancellation. The read timeout stays fully
 # configurable via `timeout_s` so slow-but-live responses are not cut off.
 _CONNECT_TIMEOUT_S = 3.05
+_ORDER_PAGE_SIZE = 500
 
 
 class AlpacaConfigError(RuntimeError):
@@ -51,10 +59,21 @@ class AlpacaAPIError(RuntimeError):
         self.retry_after_s = retry_after_s
 
 
+class IncompleteOrderEnumeration(RuntimeError):
+    """The open-order collection could not be proven complete."""
+
+    def __init__(self, reason: str, detail: str, *, orders_received: int = 0):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.orders_received = orders_received
+
+
 class UnknownOrderOutcome(RuntimeError):
     """Raised when a POST may have reached Alpaca but reconciliation is inconclusive."""
 
-    def __init__(self, client_order_id: str, cause: AlpacaAPIError, reconcile_error: Exception | None = None):
+    def __init__(
+        self, client_order_id: str, cause: AlpacaAPIError, reconcile_error: Exception | None = None
+    ):
         detail = f"order outcome unknown for client_order_id={client_order_id}: {cause}"
         if reconcile_error is not None:
             detail += f"; reconciliation failed: {reconcile_error}"
@@ -142,11 +161,15 @@ class AlpacaClient:
             "method": method.upper(),
             "resource": url.split("?", 1)[0].rsplit("/", 2)[-2:],
             "request_started_at": started,
-            "client_order_id": body.get("client_order_id") or (kwargs.get("params") or {}).get("client_order_id"),
+            "client_order_id": body.get("client_order_id")
+            or (kwargs.get("params") or {}).get("client_order_id"),
             "operation": (
-                "submission" if method.upper() == "POST" and url.endswith("/v2/orders")
-                else "cancellation" if method.upper() == "DELETE"
-                else "reconciliation_read" if "/orders" in url
+                "submission"
+                if method.upper() == "POST" and url.endswith("/v2/orders")
+                else "cancellation"
+                if method.upper() == "DELETE"
+                else "reconciliation_read"
+                if "/orders" in url
                 else "provider_read"
             ),
         }
@@ -161,14 +184,19 @@ class AlpacaClient:
                 **kwargs,
             )
         except requests.RequestException as exc:
-            event.update({"request_completed_at": time.time(), "status_code": 0, "request_id": None})
+            event.update(
+                {"request_completed_at": time.time(), "status_code": 0, "request_id": None}
+            )
             self._request_evidence.append(event)
             raise AlpacaAPIError(0, f"transport failure: {exc}") from exc
         request_id = response.headers.get("X-Request-ID") or response.headers.get("x-request-id")
-        event.update({
-            "request_completed_at": time.time(), "status_code": response.status_code,
-            "request_id": request_id,
-        })
+        event.update(
+            {
+                "request_completed_at": time.time(),
+                "status_code": response.status_code,
+                "request_id": request_id,
+            }
+        )
         try:
             payload = response.json() if response.text else {}
         except ValueError:
@@ -239,12 +267,88 @@ class AlpacaClient:
         )
 
     def get_open_orders(self) -> list[dict]:
-        payload = self._request(
-            "GET",
-            f"{self.base_url}/v2/orders",
-            params={"status": "open", "symbols": self.symbol, "limit": 100},
-        )
-        return payload if isinstance(payload, list) else []
+        """Enumerate every open order for the selected symbol, or fail explicitly.
+
+        Alpaca caps this endpoint at 500 and exposes an exclusive submission-time
+        cursor rather than a response continuation token. Order IDs provide stable
+        identity/progress checks; no partial collection is ever returned.
+        """
+        orders: list[dict] = []
+        seen_ids: set[str] = set()
+        seen_pages: set[tuple[str, ...]] = set()
+        until: str | None = None
+
+        while True:
+            params = {
+                "status": "open",
+                "symbols": alpaca_order_query_symbol(self.symbol),
+                "limit": _ORDER_PAGE_SIZE,
+                "direction": "desc",
+            }
+            if until is not None:
+                params["until"] = until
+            try:
+                payload = self._request("GET", f"{self.base_url}/v2/orders", params=params)
+            except AlpacaAPIError as exc:
+                raise IncompleteOrderEnumeration(
+                    "TRANSPORT_OR_API_FAILURE", str(exc), orders_received=len(orders)
+                ) from exc
+            if not isinstance(payload, list):
+                raise IncompleteOrderEnumeration(
+                    "MALFORMED_PAGE",
+                    "provider response is not an order list",
+                    orders_received=len(orders),
+                )
+            if len(payload) > _ORDER_PAGE_SIZE:
+                raise IncompleteOrderEnumeration(
+                    "MALFORMED_PAGE",
+                    "provider page exceeds the requested maximum size",
+                    orders_received=len(orders),
+                )
+
+            page_ids: list[str] = []
+            for index, order in enumerate(payload):
+                if not isinstance(order, dict) or not str(order.get("id") or ""):
+                    raise IncompleteOrderEnumeration(
+                        "MALFORMED_PAGE",
+                        f"order at page offset {index} has no stable ID",
+                        orders_received=len(orders),
+                    )
+                order_id = str(order["id"])
+                page_ids.append(order_id)
+
+            signature = tuple(page_ids)
+            if signature and signature in seen_pages:
+                raise IncompleteOrderEnumeration(
+                    "REPEATED_PAGE", "provider repeated an order page", orders_received=len(orders)
+                )
+            duplicate = next((order_id for order_id in page_ids if order_id in seen_ids), None)
+            if duplicate is not None or len(set(page_ids)) != len(page_ids):
+                raise IncompleteOrderEnumeration(
+                    "DUPLICATE_ORDER_ID",
+                    f"provider repeated order ID {duplicate or 'within page'}",
+                    orders_received=len(orders),
+                )
+            seen_pages.add(signature)
+            seen_ids.update(page_ids)
+            orders.extend(payload)
+
+            if len(payload) < _ORDER_PAGE_SIZE:
+                return orders
+            cursor = payload[-1].get("submitted_at")
+            if not isinstance(cursor, str) or not cursor:
+                raise IncompleteOrderEnumeration(
+                    "MALFORMED_PAGE",
+                    "full page has no valid submitted_at cursor",
+                    orders_received=len(orders),
+                )
+            if cursor == until:
+                raise IncompleteOrderEnumeration(
+                    "NON_ADVANCING_CURSOR",
+                    "provider pagination cursor did not advance",
+                    orders_received=len(orders),
+                )
+            until = cursor
 
     def _next_client_order_id(self) -> str:
         self._client_seq += 1
@@ -286,7 +390,9 @@ class AlpacaClient:
                     raise UnknownOrderOutcome(client_order_id, exc) from exc
                 raise UnknownOrderOutcome(client_order_id, exc, reconcile_exc) from exc
 
-    def submit_limit_order(self, *, side: str, qty: float, limit_price: float, spec: AssetSpec) -> dict:
+    def submit_limit_order(
+        self, *, side: str, qty: float, limit_price: float, spec: AssetSpec
+    ) -> dict:
         if not self.is_market_open(spec):
             raise MarketClosedError(f"{spec.symbol} market is closed")
         body = {
@@ -381,22 +487,30 @@ class AlpacaClient:
         ]
 
     def _crypto_market_view(self, recent_limit: int) -> MarketView:
-        ob = self._request(
-            "GET",
-            f"{CRYPTO_DATA_BASE}/latest/orderbooks",
-            params={"symbols": self.symbol},
-        ).get("orderbooks", {}).get(self.symbol, {})
+        ob = (
+            self._request(
+                "GET",
+                f"{CRYPTO_DATA_BASE}/latest/orderbooks",
+                params={"symbols": self.symbol},
+            )
+            .get("orderbooks", {})
+            .get(self.symbol, {})
+        )
         bids = [(float(x["p"]), float(x["s"])) for x in ob.get("b", [])]
         asks = [(float(x["p"]), float(x["s"])) for x in ob.get("a", [])]
         if not bids or not asks:
             raise AlpacaAPIError(200, "crypto order book missing bid or ask")
         if not ob.get("t"):
             raise AlpacaAPIError(200, "crypto order book missing timestamp")
-        raw = self._request(
-            "GET",
-            f"{CRYPTO_DATA_BASE}/trades",
-            params={"symbols": self.symbol, "limit": recent_limit},
-        ).get("trades", {}).get(self.symbol, [])
+        raw = (
+            self._request(
+                "GET",
+                f"{CRYPTO_DATA_BASE}/trades",
+                params={"symbols": self.symbol, "limit": recent_limit},
+            )
+            .get("trades", {})
+            .get(self.symbol, [])
+        )
         trades = [_parse_trade(t, crypto=True) for t in raw]
         quote_ts = parse_rfc3339(ob["t"])
         trade_ts = max((t.ts for t in trades), default=None)

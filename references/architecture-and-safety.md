@@ -36,6 +36,24 @@ Priority is `KILL > HOLD_LATE > HOLD_BLOCKED > RULES_ONLY > REDUCE > RUN`.
 - `TERMINAL_ORDER_STATES` in `jevloop/execution/alpaca.py` is `{filled, canceled, expired, rejected}` only. `done_for_day` is deliberately excluded: current Alpaca order-status documentation and support guidance describe it as "the order is done executing for the day, and will not receive further updates until the next trading day" -- a same-day pause, not closure. An earlier revision treated `done_for_day` as terminal, which discarded ownership tracking, dropped the order from cancellation candidates, and stopped polling it one trading day too early. `loop.py`'s `_refresh_order_statuses` and `_wait_terminal` import the same constant rather than redefining it, so the three call sites cannot drift out of sync again.
 - Order ownership (`_owned_client_order_ids`, and `client_order_id` prefix matching) is scoped to the current process's random session ID, by design: the runtime must never auto-cancel an order it cannot positively identify as its own. The cost of that design is that a session which ends without a clean shutdown (killed, crashed, host restart) leaves its resting orders invisible to every later session's automatic reconciliation. `AlpacaClient.get_foreign_session_open_orders()` is a read-only check (surfaced by `doctor` and at `run` startup) that lists jevloop-prefixed open orders that do not belong to the current session, so an operator is told about the gap instead of it being silent. It never cancels those orders; that stays a manual/operator decision.
 - Foreign-session orders make paper preflight not ready. Dry execution remains available and emits a structured warning containing the stable reason code and order IDs, without submitting or canceling anything.
+- `READY` has a deliberately narrow, exact meaning: the canonical paper endpoint was
+  selected; the account returned every required account-wide field with
+  `status == ACTIVE` and all of `trading_blocked`, `account_blocked`, and
+  `trade_suspended_by_user` exactly false; crypto additionally returned
+  `crypto_status == ACTIVE`; the selected asset had active, tradable,
+  broker-authoritative metadata; enumeration of **all** open orders for the selected
+  symbol completed; none was a jevloop-prefixed order from another session; and a
+  non-mock decision provider was configured. A missing capability field, malformed
+  order page, transport/API failure, repeated page, repeated order ID, or
+  non-advancing cursor makes enumeration/capability inconclusive and therefore blocks
+  readiness. READY does not prove future provider availability, market openness,
+  buying power, profitability, or authorization for any live-money endpoint.
+- The order-list adapter requests Alpaca's maximum page size (500) in descending
+  submission order, advances with the provider's exclusive `until` cursor, and uses
+  order IDs as stable page/progress identities. Crypto execution symbols retain their
+  slash (for example `BTC/USD`), while the list-query filter uses Alpaca's documented
+  compact spelling (`BTCUSD`). A partial list is never returned as a successful
+  enumeration, so it can never be evidence that foreign orders are absent.
 
 ## Market-state freshness
 

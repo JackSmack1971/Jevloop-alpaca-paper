@@ -6,6 +6,7 @@ from jevloop.execution.alpaca import (
     AlpacaClient,
     AlpacaConfigError,
     LIVE_TRADING_BASE_URL,
+    IncompleteOrderEnumeration,
     PAPER_TRADING_BASE_URL,
     TERMINAL_ORDER_STATES,
     UnknownOrderOutcome,
@@ -74,7 +75,11 @@ def test_ambiguous_order_post_is_not_retried_and_is_reconciled_by_client_id(monk
             return _Response(500, text="server error")
         return _Response(
             200,
-            payload={"id": "broker-1", "client_order_id": kwargs["params"]["client_order_id"], "status": "accepted"},
+            payload={
+                "id": "broker-1",
+                "client_order_id": kwargs["params"]["client_order_id"],
+                "status": "accepted",
+            },
         )
 
     monkeypatch.setattr("jevloop.execution.alpaca.requests.request", fake)
@@ -194,3 +199,66 @@ def test_foreign_session_open_orders_are_detected_but_not_touched(monkeypatch):
     )
     foreign = c.get_foreign_session_open_orders()
     assert [o["id"] for o in foreign] == ["b"]
+
+
+def _order(number, submitted_at):
+    return {"id": f"order-{number}", "submitted_at": submitted_at, "client_order_id": "manual"}
+
+
+def test_open_orders_normalizes_crypto_symbol_and_enumerates_more_than_500(monkeypatch):
+    calls = []
+    first = [_order(i, f"2026-01-01T00:{59 - i // 10:02d}:{59 - i % 10:02d}Z") for i in range(500)]
+    second = [_order(500 + i, "2025-12-31T23:00:00Z") for i in range(37)]
+
+    def request(method, url, **kwargs):
+        calls.append(kwargs["params"])
+        return first if len(calls) == 1 else second
+
+    c = AlpacaClient("k", "s", "BTC/USD")
+    monkeypatch.setattr(c, "_request", request)
+    assert len(c.get_open_orders()) == 537
+    assert calls[0] == {"status": "open", "symbols": "BTCUSD", "limit": 500, "direction": "desc"}
+    assert calls[1]["until"] == first[-1]["submitted_at"]
+
+
+@pytest.mark.parametrize("payload", [{"orders": []}, [None], [{"submitted_at": "now"}]])
+def test_open_orders_rejects_malformed_pages(monkeypatch, payload):
+    c = AlpacaClient("k", "s", "AAPL")
+    monkeypatch.setattr(c, "_request", lambda *args, **kwargs: payload)
+    with pytest.raises(IncompleteOrderEnumeration, match="MALFORMED_PAGE"):
+        c.get_open_orders()
+
+
+def test_open_orders_wraps_transport_failure_as_incomplete(monkeypatch):
+    c = AlpacaClient("k", "s", "AAPL")
+    monkeypatch.setattr(
+        c, "_request", lambda *a, **k: (_ for _ in ()).throw(AlpacaAPIError(0, "down"))
+    )
+    with pytest.raises(IncompleteOrderEnumeration, match="TRANSPORT_OR_API_FAILURE"):
+        c.get_open_orders()
+
+
+def test_open_orders_repeated_page_is_incomplete_not_an_infinite_loop(monkeypatch):
+    page = [_order(i, "2026-01-01T00:00:00Z") for i in range(500)]
+    calls = 0
+
+    def request(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return page
+
+    c = AlpacaClient("k", "s", "AAPL")
+    monkeypatch.setattr(c, "_request", request)
+    with pytest.raises(IncompleteOrderEnumeration, match="REPEATED_PAGE"):
+        c.get_open_orders()
+    assert calls == 2
+
+
+def test_open_orders_rejects_duplicate_ids_across_different_pages(monkeypatch):
+    first = [_order(i, "2026-01-02T00:00:00Z") for i in range(500)]
+    second = [_order(499, "2026-01-01T00:00:00Z")]
+    pages = iter((first, second))
+    c = AlpacaClient("k", "s", "AAPL")
+    monkeypatch.setattr(c, "_request", lambda *args, **kwargs: next(pages))
+    with pytest.raises(IncompleteOrderEnumeration, match="DUPLICATE_ORDER_ID"):
+        c.get_open_orders()
