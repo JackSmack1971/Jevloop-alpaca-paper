@@ -24,12 +24,31 @@ CLASSES = ("up", "down", "neutral")
 
 
 @dataclass(frozen=True)
+class CohortIdentity:
+    run_id: str
+    data_source: str
+    provider_route: str
+    provider_model: str
+    strategy_config_digest: str
+    limits_digest: str
+    battery_schema_digest: str
+
+
+@dataclass(frozen=True)
 class Observation:
     probs: dict[str, float]
     outcome: str
     ts: float
+    symbol: str
+    cohort_identity: CohortIdentity
     requested_horizon_seconds: float = 0.0
     actual_label_lag_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        symbol = self.symbol.strip().upper()
+        if not symbol:
+            raise ValueError("observation symbol must be non-empty")
+        object.__setattr__(self, "symbol", symbol)
 
 
 EXCLUSION_REASONS = (
@@ -229,7 +248,8 @@ def pair_observations(
             else:
                 outcome = "neutral"
             observations.append(Observation(
-                probs, outcome, forecast_ts, horizon_seconds,
+                probs, outcome, forecast_ts, str(row["symbol"]),
+                CohortIdentity(*(str(row[field]) for field in COHORT_FIELDS)), horizon_seconds,
                 float(label["ts"]) - forecast_ts,
             ))
     observations.sort(key=lambda obs: obs.ts)
@@ -266,7 +286,10 @@ def sample_climatology(observations: list[Observation]) -> dict[str, float]:
 
 
 def constant_forecast_brier(observations: list[Observation], probs: dict[str, float]) -> float:
-    synthetic = [Observation(probs, obs.outcome, obs.ts) for obs in observations]
+    synthetic = [
+        Observation(probs, obs.outcome, obs.ts, obs.symbol, obs.cohort_identity)
+        for obs in observations
+    ]
     return multiclass_brier(synthetic)
 
 
@@ -343,7 +366,15 @@ def _default_block_size(n: int) -> int:
 def moving_block_brier_ci(
     observations: list[Observation], *, block_size: int, draws: int = 1000, seed: int = 17
 ) -> tuple[float, float] | None:
-    """Approximate 95% CI using a moving-block bootstrap for serial dependence."""
+    """Approximate 95% CI for one symbol/cohort using a moving-block bootstrap."""
+    symbols = {obs.symbol for obs in observations}
+    if not symbols or "" in symbols:
+        raise ValueError("moving-block bootstrap requires non-empty observations with a symbol")
+    if len(symbols) != 1:
+        raise ValueError("moving-block bootstrap requires observations from exactly one symbol")
+    cohorts = {obs.cohort_identity for obs in observations}
+    if len(cohorts) != 1:
+        raise ValueError("moving-block bootstrap requires observations from exactly one cohort")
     n = len(observations)
     if block_size < 1:
         raise ValueError("block_size must be positive")
@@ -363,7 +394,8 @@ def moving_block_brier_ci(
 
 
 def summarize(
-    observations: list[Observation], *, block_size: int | None = None, bootstrap_draws: int = 1000
+    observations: list[Observation], *, block_size: int | None = None, bootstrap_draws: int = 1000,
+    selected_symbol: str | None = None,
 ) -> dict:
     brier = multiclass_brier(observations)
     uniform_probs = {k: 1.0 / len(CLASSES) for k in CLASSES}
@@ -377,11 +409,41 @@ def summarize(
     resolved_block = block_size if block_size is not None else _default_block_size(len(observations))
     if resolved_block <= 0:
         raise ValueError("block_size must be positive")
-    ci = moving_block_brier_ci(observations, block_size=resolved_block, draws=bootstrap_draws)
+    symbols = {obs.symbol for obs in observations}
+    cohorts = {obs.cohort_identity for obs in observations}
+    bootstrap_requested = bootstrap_draws > 0
+    if bootstrap_requested and not selected_symbol:
+        raise ValueError("selected_symbol is required for moving-block confidence intervals")
+    if selected_symbol and symbols and symbols != {selected_symbol.strip().upper()}:
+        raise ValueError("selected_symbol does not match every observation")
+    ci = (moving_block_brier_ci(observations, block_size=resolved_block, draws=bootstrap_draws)
+          if bootstrap_requested else None)
     sensitivity: dict[str, list[float] | None] = {}
-    for candidate in sorted({max(1, resolved_block // 2), resolved_block, resolved_block * 2}):
-        candidate_ci = moving_block_brier_ci(observations, block_size=candidate, draws=bootstrap_draws)
-        sensitivity[str(candidate)] = list(candidate_ci) if candidate_ci else None
+    if bootstrap_requested:
+        for candidate in sorted({max(1, resolved_block // 2), resolved_block, resolved_block * 2}):
+            candidate_ci = moving_block_brier_ci(
+                observations, block_size=candidate, draws=bootstrap_draws
+            )
+            sensitivity[str(candidate)] = list(candidate_ci) if candidate_ci else None
+
+    cohort_metadata = None
+    if len(cohorts) == 1:
+        cohort = next(iter(cohorts))
+        cohort_metadata = {field: getattr(cohort, field) for field in COHORT_FIELDS}
+    interval_metadata = {
+        "status": "reported" if ci else "omitted",
+        "omission_reason": (None if ci else
+                            "bootstrap disabled" if not bootstrap_requested else
+                            "insufficient observations for requested block sizes"),
+        "selected_symbol": selected_symbol.strip().upper() if selected_symbol else None,
+        "cohort_identity": cohort_metadata,
+        "block_size": resolved_block,
+        "block_size_method": ("explicit" if block_size is not None
+                              else "n^(1/3) transparent heuristic"),
+        "sensitivity_values": sensitivity,
+        "observation_count": len(observations),
+        "draws": bootstrap_draws,
+    }
 
     support_warnings: list[str] = []
     if len(observations) < 100:
@@ -404,6 +466,7 @@ def summarize(
         "bootstrap_block_size": resolved_block,
         "bootstrap_block_size_method": "explicit" if block_size is not None else "n^(1/3) transparent heuristic",
         "bootstrap_block_sensitivity": sensitivity,
+        "moving_block_interval_metadata": interval_metadata,
         "negative_log_loss": negative_log_loss(observations),
         "accuracy": accuracy(observations),
         "top_label_equal_width_ece": top_ece,
@@ -445,6 +508,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("horizon must be positive and neutral band/age/lag limits non-negative")
     if args.block_size is not None and args.block_size <= 0:
         parser.error("block size must be positive")
+    if args.bootstrap_draws < 0:
+        parser.error("bootstrap draws must be non-negative")
+    if args.bootstrap_draws > 0 and not args.symbol:
+        parser.error("--symbol is required when moving-block confidence intervals are requested; "
+                     "use --bootstrap-draws 0 for multi-symbol descriptive metrics")
 
     ticks = load_ticks()
     try:
@@ -464,7 +532,10 @@ def main(argv: list[str] | None = None) -> int:
         print("no eligible direction probability observations; exclusions="
               + json.dumps(pairing.exclusion_counts, sort_keys=True))
         return 2
-    report = summarize(observations, block_size=args.block_size, bootstrap_draws=args.bootstrap_draws)
+    report = summarize(
+        observations, block_size=args.block_size, bootstrap_draws=args.bootstrap_draws,
+        selected_symbol=args.symbol,
+    )
     report.update({
         "requested_horizon_seconds": args.horizon_seconds,
         "max_label_lag_seconds": args.max_label_lag_seconds,

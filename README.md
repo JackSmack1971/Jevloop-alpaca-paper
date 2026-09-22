@@ -94,6 +94,13 @@ authorization step. Mock judgments are always no-order and cannot be combined wi
 - moving-block-bootstrap Brier uncertainty plus block-length sensitivity;
 - class-support warnings.
 
+Moving-block confidence intervals are a single-series operation: `--symbol` is
+required whenever `--bootstrap-draws` is greater than zero (the default). Use
+`--bootstrap-draws 0` to retain multi-symbol descriptive metrics; that output
+explicitly marks the aggregate interval as omitted rather than pooling symbols.
+The interval metadata records the selected symbol, cohort, block size and
+sensitivity values, and observation count.
+
 The command always labels its result `DESCRIPTIVE_ONLY`. No fixed sample size or single calibration metric becomes a deployment-readiness certificate. Strategy-performance claims require separate temporal/purged out-of-sample analysis, costs/slippage, and selection/multiple-testing controls. See `references/evaluation-methodology.md`.
 
 ## Why this is not called HFT

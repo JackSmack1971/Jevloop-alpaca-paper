@@ -1,18 +1,38 @@
 import math
 import pytest
 from jevloop.calibrate import (
-    Observation, accuracy, adaptive_classwise_ece, confidence_ece, multiclass_brier,
-    negative_log_loss, pair_observations, summarize
+    CohortIdentity, Observation, accuracy, adaptive_classwise_ece, confidence_ece,
+    main, moving_block_brier_ci, multiclass_brier, negative_log_loss, pair_observations, summarize
 )
 
 
+COHORT = CohortIdentity("run-a", "alpaca-market-data", "responses", "model-a",
+                        "config-a", "limits", "battery")
+
+
+def _obs(probs, outcome, ts, symbol="BTC/USD"):
+    return Observation(probs, outcome, ts, symbol, COHORT)
+
+
+def test_observation_rejects_empty_symbol_identity():
+    with pytest.raises(ValueError, match="symbol must be non-empty"):
+        _obs(PROBS, "up", 0, "  ")
+
+
+def test_cli_requires_symbol_when_bootstrap_is_requested(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--bootstrap-draws", "10"])
+    assert exc.value.code == 2
+    assert "--symbol is required" in capsys.readouterr().err
+
+
 def test_perfect_multiclass_brier_is_zero():
-    obs=[Observation({"up":1,"down":0,"neutral":0},"up",0)]
+    obs=[_obs({"up":1,"down":0,"neutral":0},"up",0)]
     assert multiclass_brier(obs)==0
 
 
 def test_uniform_three_class_brier_is_two_thirds():
-    obs=[Observation({"up":1/3,"down":1/3,"neutral":1/3},"down",0)]
+    obs=[_obs({"up":1/3,"down":1/3,"neutral":1/3},"down",0)]
     assert multiclass_brier(obs)==pytest.approx(2/3)
 
 
@@ -29,14 +49,14 @@ def test_mock_excluded_by_default():
 
 
 def test_small_sample_marked_inconclusive():
-    obs=[Observation({"up":.8,"down":.1,"neutral":.1},"up",i) for i in range(20)]
+    obs=[_obs({"up":.8,"down":.1,"neutral":.1},"up",i) for i in range(20)]
     report=summarize(obs,bootstrap_draws=0)
     assert report["status"]=="DESCRIPTIVE_ONLY"
     assert report["support_warnings"]
 
 
 def test_metrics_finite_for_valid_sample():
-    obs=[Observation({"up":.8,"down":.1,"neutral":.1},"up",0),Observation({"up":.2,"down":.7,"neutral":.1},"down",1)]
+    obs=[_obs({"up":.8,"down":.1,"neutral":.1},"up",0),_obs({"up":.2,"down":.7,"neutral":.1},"down",1)]
     assert accuracy(obs)==1
     assert math.isfinite(negative_log_loss(obs))
     ece, _ = confidence_ece(obs)
@@ -44,9 +64,9 @@ def test_metrics_finite_for_valid_sample():
 
 def test_sample_climatology_is_reported_as_reference_not_readiness_claim():
     obs = [
-        Observation({"up": .7, "down": .2, "neutral": .1}, "up", 0),
-        Observation({"up": .2, "down": .7, "neutral": .1}, "down", 1),
-        Observation({"up": .2, "down": .2, "neutral": .6}, "neutral", 2),
+        _obs({"up": .7, "down": .2, "neutral": .1}, "up", 0),
+        _obs({"up": .2, "down": .7, "neutral": .1}, "down", 1),
+        _obs({"up": .2, "down": .2, "neutral": .6}, "neutral", 2),
     ]
     report = summarize(obs, bootstrap_draws=0)
     assert report["sample_climatology_probabilities"] == pytest.approx({"up": 1/3, "down": 1/3, "neutral": 1/3})
@@ -55,13 +75,48 @@ def test_sample_climatology_is_reported_as_reference_not_readiness_claim():
 
 def test_adaptive_classwise_ece_is_bounded():
     obs = [
-        Observation({"up": .8, "down": .1, "neutral": .1}, "up", 0),
-        Observation({"up": .2, "down": .7, "neutral": .1}, "down", 1),
-        Observation({"up": .2, "down": .2, "neutral": .6}, "neutral", 2),
+        _obs({"up": .8, "down": .1, "neutral": .1}, "up", 0),
+        _obs({"up": .2, "down": .7, "neutral": .1}, "down", 1),
+        _obs({"up": .2, "down": .2, "neutral": .6}, "neutral", 2),
     ]
     ece, table = adaptive_classwise_ece(obs, bins=3)
     assert 0 <= ece <= 1
     assert set(table) == {"up", "down", "neutral"}
+
+
+def test_interleaved_symbols_cannot_produce_pooled_moving_block_interval():
+    observations = [
+        _obs(PROBS, "up", i, "BTC/USD" if i % 2 == 0 else "ETH/USD")
+        for i in range(24)
+    ]
+    with pytest.raises(ValueError, match="exactly one symbol"):
+        moving_block_brier_ci(observations, block_size=2, draws=20)
+
+    report = summarize(observations, bootstrap_draws=0)
+    assert report["n"] == 24
+    assert report["brier_95pct_moving_block_bootstrap_ci"] is None
+    assert report["moving_block_interval_metadata"]["status"] == "omitted"
+    assert report["moving_block_interval_metadata"]["selected_symbol"] is None
+
+
+def test_single_symbol_moving_block_interval_is_deterministic_and_described():
+    observations = [
+        _obs({"up": .6 + (i % 3) / 10, "down": .3 - (i % 3) / 10,
+              "neutral": .1}, "up" if i % 2 else "down", i)
+        for i in range(30)
+    ]
+    first = moving_block_brier_ci(observations, block_size=3, draws=100, seed=91)
+    second = moving_block_brier_ci(observations, block_size=3, draws=100, seed=91)
+    assert first == second
+
+    report = summarize(observations, block_size=3, bootstrap_draws=100,
+                       selected_symbol="BTC/USD")
+    metadata = report["moving_block_interval_metadata"]
+    assert metadata["selected_symbol"] == "BTC/USD"
+    assert metadata["cohort_identity"]["run_id"] == "run-a"
+    assert metadata["block_size"] == 3
+    assert metadata["sensitivity_values"] == report["bootstrap_block_sensitivity"]
+    assert metadata["observation_count"] == 30
 
 
 def _row(ts, *, run="run-a", source="alpaca-market-data", mode="dry-real",
