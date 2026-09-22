@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .assets import AssetSpec, quantize_quantity, quantity_for_notional
 from .battery import run_battery
-from .client import DecisionClientError
+from .client import DecisionClientError, DecisionSchemaError
 from .execution.alpaca import (
     TERMINAL_ORDER_STATES,
     AlpacaAPIError,
@@ -459,7 +459,7 @@ def run(
                 answers, meta = run_battery(decision_client, snapshot, timeout=timeout)
                 runtime.recent_latencies_ms.append(float(meta["latency_ms"]))
                 runtime.recent_latencies_ms = runtime.recent_latencies_ms[-10:]
-            except (DecisionClientError, ValueError, KeyError, TypeError) as exc:
+            except (DecisionClientError, DecisionSchemaError) as exc:
                 decision_late = "deadline" in str(exc).lower()
                 jev_down = not decision_late
                 print(f"tick {block}: decision unavailable: {exc}")

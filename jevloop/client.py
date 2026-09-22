@@ -8,6 +8,7 @@ import math
 import os
 import random
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import requests
@@ -23,6 +24,23 @@ _CONNECT_TIMEOUT_S = 3.05
 
 class DecisionClientError(RuntimeError):
     pass
+
+
+class DecisionSchemaError(RuntimeError):
+    """A provider response did not satisfy the public decision schema."""
+
+
+def _response_parts(data: object, *, default_model: str) -> tuple[Mapping, dict]:
+    """Extract a provider response without echoing provider-controlled content."""
+    if not isinstance(data, Mapping):
+        raise DecisionSchemaError("decision response must be a mapping")
+    answers = data.get("answers")
+    if not isinstance(answers, Mapping):
+        raise DecisionSchemaError("decision response field 'answers' must be a mapping")
+    return answers, {
+        "model": data.get("model", default_model),
+        "usage": data.get("usage", {}),
+    }
 
 
 @dataclass
@@ -78,8 +96,9 @@ class TypeSafeDirectClient(BaseDecisionClient):
         t0 = time.monotonic()
         data = _post(TYPESAFE_DIRECT_URL, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                      {"state": state, "model": self.model, "questions": questions}, timeout)
-        return data["answers"], {"route": self.name, "model": data.get("model", self.model),
-                                 "latency_ms": round((time.monotonic()-t0)*1000, 2), "usage": data.get("usage", {})}
+        answers, response_meta = _response_parts(data, default_model=self.model)
+        return answers, {"route": self.name, **response_meta,
+                         "latency_ms": round((time.monotonic()-t0)*1000, 2)}
 
 
 class GatewayClient(BaseDecisionClient):
@@ -90,8 +109,9 @@ class GatewayClient(BaseDecisionClient):
         t0 = time.monotonic()
         data = _post(GATEWAY_URL, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                      {"state": state, "model": self.model, "questions": questions}, timeout)
-        return data["answers"], {"route": self.name, "model": data.get("model", self.model),
-                                 "latency_ms": round((time.monotonic()-t0)*1000, 2), "usage": data.get("usage", {})}
+        answers, response_meta = _response_parts(data, default_model=self.model)
+        return answers, {"route": self.name, **response_meta,
+                         "latency_ms": round((time.monotonic()-t0)*1000, 2)}
 
 
 class MockDecisionClient(BaseDecisionClient):

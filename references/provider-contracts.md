@@ -8,6 +8,7 @@ Load this reference for setup, API, provider, symbol, rate-limit, or execution-c
 - Vercel's 2026-09-21 Jev integration documents both a TypeSafe-compatible base URL (`https://ai-gateway.vercel.sh/typesafe`, preserving `/v1/systemone`) and a native AI Gateway evaluation surface at `POST https://ai-gateway.vercel.sh/v1/evaluate`.
 - Vercel identifies the Gateway model as `typesafe-ai/jev`. This package intentionally uses the TypeSafe-compatible shape so direct TypeSafe and Gateway routes share one battery contract.
 - Provider probabilities/confidence are observations to validate on this task distribution, not guaranteed calibration claims.
+- Every returned choice/score probability distribution must use exactly the requested option keys, contain finite numeric values in `[0, 1]`, and sum to `1` within an absolute tolerance of `0.02`.
 
 ## Alpaca Trading API
 
