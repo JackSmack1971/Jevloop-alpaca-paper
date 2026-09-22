@@ -1,6 +1,6 @@
 [project]
 name = "jev-loop"
-version = "0.3.1"
+version = "0.3.2"
 description = "Paper-first market decision harness with bounded Jev judgments and deterministic risk/execution gates."
 requires-python = ">=3.10"
 dependencies = [

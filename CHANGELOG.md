@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.2 — 2026-09-22
+
+Release-completeness and executable-invariant pass across the paper runtime, evidence,
+evaluation, dependency, and automation surfaces.
+
+- Made one canonical paper preflight result the authority for paper activation, with typed readiness failures and foreign-session-order blocking shared by `doctor` and `run --paper`.
+- Added typed provider-schema failures so malformed or structurally invalid decision responses fail closed without being conflated with transport errors.
+- Reconciled session-owned orders on abnormal loop exits before propagating the original failure, while preserving evidence about any reconciliation failure.
+- Introduced evidence schema v3 with validated serialization, process/run correlation, request and broker identifiers, configuration provenance, and explicit cohort-exclusion reasons for older or malformed records.
+- Isolated calibration cohorts by schema, package/Git/config/provider provenance and required symbol-scoped moving-block bootstrap intervals instead of pooling incomparable observations.
+- Enforced total decision-response deadlines, including late successful responses, and recorded monotonic timing evidence for the complete provider call.
+- Enabled implicit skill routing while keeping paper side effects behind independent user-intent, `--paper`, canonical-preflight, and environment-policy gates.
+- Added an opt-in executable paired Codex evaluation runner with isolated worktrees, repeated with-skill/without-skill trials, deterministic graders, raw counts, and redacted audit output. External evaluation remains separate from offline verification and is not claimed unless actually run.
+- Extracted tick decision logic into a pure reducer shared by runtime and simulation, with parity coverage for state transitions, actions, and evidence fields.
+- Committed `uv.lock` and documented locked synchronization and freshness checking for reproducible Python 3.10+ dependency resolution.
+- Added least-privilege GitHub Actions CI gates on Python 3.10 for locked sync, lock freshness, package validation, the full test suite, Ruff, and byte-compilation.
+
 ## 0.3.1 — 2026-09-22
 
 Research-verified correctness, protocol, and evidence-durability pass. Every module was re-audited against current upstream documentation (Alpaca order-status/asset-schema docs, Requests timeout docs, OpenAI Codex/Astra skill guidance) rather than prose review alone; see `references/source-audit.md` for the full file-by-file record.
