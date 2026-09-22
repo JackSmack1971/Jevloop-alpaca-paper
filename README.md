@@ -46,7 +46,11 @@ uv run jev-loop run --ticks 30 --symbol BTC/USD
 uv run jev-loop run --paper --ticks 30 --symbol BTC/USD
 ```
 
-Mock judgments are always no-order and cannot be combined with `--paper`.
+`run --paper` also enforces the canonical preflight before activating paper authority or
+allowing an order submission. This checks the paper endpoint, account and asset status,
+provider configuration, and foreign-session `jevloop-` orders. `doctor` is an independent,
+read-only inspection command which displays the same readiness decision; it is not an
+authorization step. Mock judgments are always no-order and cannot be combined with `--paper`.
 
 ## Runtime safety properties
 
@@ -58,6 +62,7 @@ Mock judgments are always no-order and cannot be combined with `--paper`.
 - Each order uses a unique session `client_order_id`. Ambiguous transport/5xx POST outcomes are looked up by client order ID and are **not** blindly retried.
 - If that lookup is still inconclusive, the run stops fail-closed rather than misclassifying the event as a rejection.
 - Account-wide cancellation is never used. Accepted/submitted orders are never counted as fills.
+- Foreign-session `jevloop-` orders block paper preflight and are reported as structured warnings in dry execution; they are never canceled automatically.
 - Directional market orders remain disabled by default; spot sell quantity cannot exceed broker-reconciled long inventory.
 
 ## Probability diagnostics

@@ -14,21 +14,20 @@ import sys
 import time
 from pathlib import Path
 
-from .assets import AssetSpec, AssetNotTradableError, quantize_quantity, quantity_for_notional
+from .assets import AssetSpec, quantize_quantity, quantity_for_notional
 from .battery import run_battery
-from .client import DecisionClientError, resolve_decision_client
+from .client import DecisionClientError
 from .execution.alpaca import (
     TERMINAL_ORDER_STATES,
     AlpacaAPIError,
-    AlpacaConfigError,
     MarketClosedError,
     UnknownOrderOutcome,
-    client_from_env,
 )
 from .ladder import Rung, select_rung
 from .limits import Limits
 from .policy import KILL, PULL_QUOTES, QUOTE_BOTH_SIDES, QUOTE_WIDE, STAND_DOWN, WIDEN, compose_action, fallback_action
 from .pricing import bounded_quote_prices
+from .preflight import FOREIGN_SESSION_ORDERS, paper_preflight
 from .risk import check as risk_check
 from .state import RuntimeState, TradeTick, build_snapshot, observe_trades, record_fill_slippage
 
@@ -304,12 +303,24 @@ def run(
     limits: Limits,
 ) -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        alpaca = client_from_env(symbol=symbol)
-        spec = alpaca.load_asset_spec()
-        decision_client = resolve_decision_client(mock=mock)
-    except (AlpacaConfigError, AlpacaAPIError, AssetNotTradableError, DecisionClientError) as exc:
-        print(f"cannot start: {exc}")
+    preflight = paper_preflight(symbol=symbol, mock=mock)
+    foreign_reasons = preflight.reasons_with_code(FOREIGN_SESSION_ORDERS)
+    if not dry_execution and not preflight.ready:
+        for reason in preflight.reasons:
+            print(f"PREFLIGHT_BLOCKED code={reason.code} message={reason.message}")
+        return 2
+
+    # Dry mode remains an inspection path. It may continue where the existing runtime
+    # dependencies are usable, and reports foreign ownership as machine-readable data.
+    if foreign_reasons:
+        for reason in foreign_reasons:
+            print(json.dumps({"event": "paper_preflight_warning", "code": reason.code, "details": reason.details}))
+    alpaca = preflight.alpaca
+    spec = preflight.asset
+    decision_client = preflight.decision_client
+    if alpaca is None or spec is None or decision_client is None:
+        for reason in preflight.reasons:
+            print(f"cannot start: [{reason.code}] {reason.message}")
         return 2
 
     if decision_client.name == "MOCK" and not dry_execution:
@@ -319,19 +330,6 @@ def run(
     print(f"asset verified by Alpaca: {spec.symbol} ({spec.asset_class}, status={spec.status}, tradable={spec.tradable})")
     print(f"decision client: {decision_client.name} / {decision_client.model}")
     print("execution: " + ("DRY (no orders)" if dry_execution else "PAPER (explicit --paper)"))
-    try:
-        foreign = alpaca.get_foreign_session_open_orders()
-        if foreign:
-            ids = [str(o.get("id")) for o in foreign]
-            print(
-                f"NOTICE: {len(foreign)} open order(s) carry this package's client-order "
-                f"prefix but belong to a different session (ids={ids}); this session will not "
-                "auto-cancel them, they are likely resting from a prior run that did not shut "
-                "down cleanly, and they need manual/operator reconciliation via the broker."
-            )
-    except AlpacaAPIError as exc:
-        print(f"NOTICE: could not check for prior-session orders: {exc}")
-
     runtime = RuntimeState()
     trade_history: list[TradeTick] = []
     recent_records: list[dict] = []
