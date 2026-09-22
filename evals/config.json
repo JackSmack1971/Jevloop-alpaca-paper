@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "codex_version": "REQUIRED",
+  "model": "REQUIRED",
+  "repetitions": 3,
+  "timeout_seconds": 900,
+  "cases_file": "cases.jsonl",
+  "variants": ["with_skill", "without_skill"]
+}

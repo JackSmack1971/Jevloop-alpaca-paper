@@ -17,7 +17,8 @@ REQUIRED = {
     "references/evaluation-methodology.md", "references/live-trading.md",
     "references/research-notes.md", "references/source-audit.md", "agents/openai.yaml", "assets/dashboard/index.html",
     "scripts/validate_package.py", "evals/README.md", "evals/routing.jsonl", "evals/tasks.jsonl",
-    "evals/failures.jsonl",
+    "evals/failures.jsonl", "evals/config.json", "evals/cases.jsonl", "evals/run.py",
+    "evals/graders.py",
 }
 FORBIDDEN_ARTIFACTS = {".env", ".DS_Store"}
 SECRET_PATTERNS = [
@@ -152,6 +153,68 @@ def main() -> int:
         for case, expected in required_cases.items():
             if not any(row.get("case") == case and row.get("expected") == expected for row in routing_rows):
                 fail(f"routing corpus missing {case} case labeled {expected}", errors)
+
+    # Validate the external runner's declarative contract only. This intentionally
+    # does not execute Codex or imply that an evaluation trial has run.
+    eval_config_path = ROOT / "evals/config.json"
+    eval_cases_path = ROOT / "evals/cases.jsonl"
+    if eval_config_path.exists():
+        try:
+            config = json.loads(eval_config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            fail(f"invalid eval runner config: {exc}", errors)
+            config = {}
+        if config.get("schema_version") != 1:
+            fail("eval runner config schema_version must be 1", errors)
+        if config.get("variants") != ["with_skill", "without_skill"]:
+            fail("eval runner must define paired with_skill/without_skill variants", errors)
+        if not isinstance(config.get("repetitions"), int) or config.get("repetitions", 0) < 2:
+            fail("eval runner repetitions must be an integer >= 2", errors)
+        if config.get("cases_file") != "cases.jsonl":
+            fail("eval runner cases_file must be cases.jsonl", errors)
+        for pin in ("codex_version", "model"):
+            if not isinstance(config.get(pin), str) or not config.get(pin):
+                fail(f"eval runner {pin} must be a nonempty pin or REQUIRED sentinel", errors)
+    if eval_cases_path.exists():
+        required_case_keys = {"id", "kind", "prompt", "expected_skill"}
+        ids: set[str] = set()
+        eval_cases = []
+        for lineno, line in enumerate(eval_cases_path.read_text(encoding="utf-8").splitlines(), 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                fail(f"invalid JSONL cases.jsonl:{lineno}: {exc}", errors)
+                continue
+            eval_cases.append(row)
+            missing_keys = required_case_keys - row.keys()
+            if missing_keys:
+                fail(f"cases.jsonl:{lineno} missing keys: {sorted(missing_keys)}", errors)
+            if row.get("id") in ids:
+                fail(f"duplicate eval case id: {row.get('id')}", errors)
+            ids.add(row.get("id"))
+            if row.get("kind") not in {"routing", "task"}:
+                fail(f"cases.jsonl:{lineno} kind must be routing or task", errors)
+        required_flags = {
+            "live_request", "requires_preflight", "mock_mode", "code_change", "recovery_case",
+        }
+        for flag in required_flags:
+            if not any(row.get(flag) is True for row in eval_cases):
+                fail(f"eval cases missing coverage flag: {flag}", errors)
+        if not any(row.get("id") == "route-neighbor" and row.get("expected_skill") is False for row in eval_cases):
+            fail("eval cases missing negative neighbor routing case", errors)
+
+    graders_path = ROOT / "evals/graders.py"
+    if graders_path.exists():
+        grader_source = graders_path.read_text(encoding="utf-8")
+        required_graders = {
+            "skill_selection", "neighbor_rejection", "live_boundary_routing",
+            "no_live_endpoint_addition", "read_only_side_effect_free",
+            "mandatory_paper_preflight", "mock_never_submits", "reference_selection",
+            "relevant_checks", "evidence_accuracy", "safe_recovery",
+        }
+        for grader in required_graders:
+            if f'"{grader}"' not in grader_source:
+                fail(f"deterministic grader missing: {grader}", errors)
 
     # The broker implementation must preserve the main safety invariants as source contracts.
     alpaca = (ROOT / "jevloop/execution/alpaca.py").read_text(encoding="utf-8")
