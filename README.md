@@ -35,12 +35,15 @@ Standalone setup:
 ```bash
 cd jev-loop
 cp .env.example .env
-uv sync --group dev
+uv sync --locked --group dev
 uv run pytest -q
 uv run python scripts/validate_package.py
 ```
 
-`uv.lock` is intentionally not fabricated in this artifact: dependency resolution was unavailable in the build environment. On a networked development machine, run `uv lock`, review the result, commit it, and use `uv sync --locked` in CI for reproducible installs.
+`uv.lock` records the reviewed Python 3.10+ runtime and development dependency graph.
+After changing `pyproject.toml`, regenerate it with the project's supported `uv` version
+and review the diff. Use `uv lock --check` to detect a stale lock without changing it,
+and use `uv sync --locked` (with `--group dev` for development) for reproducible installs.
 
 ## Safe first run
 

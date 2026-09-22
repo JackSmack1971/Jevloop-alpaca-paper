@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
-    "SKILL.md", "README.md", "CHANGELOG.md", "VALIDATION_REPORT.md", "pyproject.toml", ".env.example",
+    "SKILL.md", "README.md", "CHANGELOG.md", "VALIDATION_REPORT.md", "pyproject.toml", "uv.lock", ".env.example",
     "jevloop/__main__.py", "jevloop/loop.py", "jevloop/evidence.py", "jevloop/execution/alpaca.py",
     "jevloop/calibrate.py", "jevloop/doctor.py", "jevloop/simulate.py",
     "references/provider-contracts.md", "references/architecture-and-safety.md",
@@ -40,6 +40,27 @@ def main() -> int:
     missing = sorted(REQUIRED - rels)
     if missing:
         fail(f"missing required files: {missing}", errors)
+
+    # Keep this package validator dependency-independent while rejecting missing,
+    # malformed, or obviously partial lockfiles. CI/release validation should also
+    # run `uv lock --check`, which is authoritative for pyproject/lock freshness.
+    lock_path = ROOT / "uv.lock"
+    if lock_path.exists():
+        lock = lock_path.read_text(encoding="utf-8")
+        if not lock.startswith('version = 1\nrevision = 2\nrequires-python = ">=3.10"\n'):
+            fail("uv.lock header or Python compatibility is unexpected", errors)
+        package_names = set(re.findall(r'^name = "([^"]+)"$', lock, re.MULTILINE))
+        required_packages = {
+            "jev-loop", "python-dotenv", "requests", "pytest", "ruff",
+            "certifi", "charset-normalizer", "idna", "urllib3",
+        }
+        absent_packages = sorted(required_packages - package_names)
+        if absent_packages:
+            fail(f"uv.lock dependency graph is incomplete: {absent_packages}", errors)
+        if 'source = { editable = "." }' not in lock:
+            fail("uv.lock does not contain the editable project root", errors)
+        if not re.search(r'^\s*\{ url = ".+", hash = "sha256:[0-9a-f]{64}"', lock, re.MULTILINE):
+            fail("uv.lock does not contain hashed distribution artifacts", errors)
 
     for p in files:
         rel = p.relative_to(ROOT).as_posix()
@@ -226,7 +247,7 @@ def main() -> int:
     loop = (ROOT / "jevloop/loop.py").read_text(encoding="utf-8")
     if 'parser.add_argument("--live"' in loop:
         fail("CLI unexpectedly exposes --live", errors)
-    for required_text in ("mock judgments may not drive broker orders", "broker-reconciled inventory", "flatten verified by broker", "HOLD_BLOCKED"):
+    for required_text in ("mock judgments may not drive broker orders", "broker-authoritative state reconciliation", "flatten verified by broker", "HOLD_BLOCKED"):
         if required_text not in loop:
             fail(f"loop missing evidence/safety mechanism: {required_text}", errors)
     evidence = (ROOT / "jevloop/evidence.py").read_text(encoding="utf-8")
