@@ -1,0 +1,50 @@
+{"prompt": "Run jev-loop offline for 50 ticks and show the decision ladder.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Use the Jev loop on BTC/USD in dry execution mode.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Calibrate Jev direction probabilities from my jev-loop logs.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Why did jev-loop enter RULES_ONLY on the last run?", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Change jev-loop so stale data cancels its own quotes.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Validate AAPL with Alpaca before a jev-loop paper run.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Open the local jev-loop dashboard.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Audit the seven Jev battery questions for arithmetic leakage.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Tighten the jev-loop risk gate for projected inventory.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Run the jev-loop doctor for ETH/USD.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Explain the deterministic versus Jev split in this skill.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Test whether jev-loop cancels only session-owned orders.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Improve the probability calibration report for jev-loop.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Debug an Alpaca rejection coming from jev-loop.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Run jev-loop paper mode for 20 ticks after preflight.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Inspect jev-loop's TypeSafe direct model configuration.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Why is the Jev decision deadline making the loop hold?", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Modify jev-loop pricing without moving risk policy into the model.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Test the mock decision client without sending any broker orders.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Review the jev-loop JSONL schema and terminal evidence.", "expected": "activate", "reason": "direct jev-loop operation/maintenance"}
+{"prompt": "Should I buy Bitcoin today?", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Backtest my moving average strategy in ccxt.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Explain Avellaneda-Stoikov from first principles.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Find the best Alpaca brokerage plan.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Write a generic Python REST client.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Review my retirement portfolio allocation.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Build a websocket order book collector unrelated to jev-loop.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "What is a Brier score?", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Analyze Tesla earnings.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Create a generic dashboard for a Flask app.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "How do I install uv?", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Research crypto market microstructure papers.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Compare brokerage APIs for US equities.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Write pytest tests for my unrelated repository.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Explain probability calibration for classifiers.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Help me tune a random forest.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Summarize Alpaca API documentation.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Create an HFT architecture from scratch.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Convert dollars to euros.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "Tell me the current BTC price.", "expected": "do_not_activate", "reason": "outside workflow"}
+{"prompt": "I have Alpaca credentials; write a one-off paper order script.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Audit another trading bot for risk controls.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Calibrate a classifier that is not used by jev-loop.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Build a new TypeSafe/Jev application unrelated to markets.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Review a backtesting repository for look-ahead bias.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Add a local dashboard to a different market-data project.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Explain whether my live trading automation is safe.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Create a generic Codex skill for financial research.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Analyze a JSONL trading log from a different system.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}
+{"prompt": "Implement Alpaca asset discovery in another application.", "expected": "neighbor", "reason": "related domain but not jev-loop-owned workflow"}

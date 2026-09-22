@@ -1,0 +1,5 @@
+{"id": "F01", "condition": "Alpaca credentials missing", "safe_resolution": "BLOCKED/UNVERIFIED_RUNTIME; do not substitute synthetic broker evidence"}
+{"id": "F02", "condition": "market data timestamp stale", "safe_resolution": "cancel session-owned resting orders and place no new orders"}
+{"id": "F03", "condition": "order POST transport uncertainty", "safe_resolution": "do not automatically retry; reconcile broker state before another submission"}
+{"id": "F04", "condition": "pre-existing nonzero position with unknown age", "safe_resolution": "mark age unknown and refuse new exposure until reconciled"}
+{"id": "F05", "condition": "flatten order not broker-verified", "safe_resolution": "report unresolved inventory and stop; never claim flat"}

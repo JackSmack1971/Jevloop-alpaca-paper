@@ -1,0 +1,40 @@
+[project]
+name = "jev-loop"
+version = "0.3.1"
+description = "Paper-first market decision harness with bounded Jev judgments and deterministic risk/execution gates."
+requires-python = ">=3.10"
+dependencies = [
+  "python-dotenv>=1.0,<2",
+  "requests>=2.31,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
+
+[project.scripts]
+jev-loop = "jevloop.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jevloop*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Pinned explicitly: prior to 0.3.1 this table was empty, so a `ruff check` run picked
+# up whatever a given installed ruff version defaults to. Ruff was also never actually
+# executed against this package before 0.3.1 (dependency resolution was unavailable in
+# the build environment), so that drift was latent rather than observed. Pinned here to
+# ruff's own documented stable baseline (pycodestyle errors + Pyflakes) so a lint run is
+# reproducible across ruff versions instead of silently growing/shrinking in scope.
+select = ["E4", "E7", "E9", "F"]
