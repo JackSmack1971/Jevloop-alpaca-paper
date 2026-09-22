@@ -3,5 +3,5 @@ interface:
   short_description: "Operate and maintain the paper-only Jev + Alpaca decision harness."
   default_prompt: "Use $jev-loop to inspect the harness, choose the narrowest safe mode, verify broker/runtime evidence, and report anything that remains unverified. Do not create external side effects unless I explicitly request paper execution."
 policy:
-  # Operational use can submit paper broker orders, so activation is explicit by default.
-  allow_implicit_invocation: false
+  # Routing may be implicit; activation never grants paper broker authority.
+  allow_implicit_invocation: true
