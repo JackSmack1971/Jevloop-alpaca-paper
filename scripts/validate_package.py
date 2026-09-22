@@ -16,7 +16,8 @@ REQUIRED = {
     "references/provider-contracts.md", "references/architecture-and-safety.md",
     "references/evaluation-methodology.md", "references/live-trading.md",
     "references/research-notes.md", "references/source-audit.md", "agents/openai.yaml", "assets/dashboard/index.html",
-    "scripts/validate_package.py", "evals/README.md", "evals/routing.jsonl", "evals/tasks.jsonl",
+    "scripts/validate_package.py", ".github/workflows/ci.yml", "jevloop/reducer.py",
+    "evals/README.md", "evals/routing.jsonl", "evals/tasks.jsonl",
     "evals/failures.jsonl", "evals/config.json", "evals/cases.jsonl", "evals/run.py",
     "evals/graders.py",
 }
@@ -40,6 +41,16 @@ def main() -> int:
     missing = sorted(REQUIRED - rels)
     if missing:
         fail(f"missing required files: {missing}", errors)
+
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    package_init = (ROOT / "jevloop/__init__.py").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    version_match = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE)
+    init_match = re.search(r'^__version__ = "([^"]+)"$', package_init, re.MULTILINE)
+    if not version_match or not init_match or version_match.group(1) != init_match.group(1):
+        fail("pyproject and runtime package versions must match", errors)
+    elif f"## {version_match.group(1)} " not in changelog:
+        fail("CHANGELOG.md is missing the current project version", errors)
 
     # Keep this package validator dependency-independent while rejecting missing,
     # malformed, or obviously partial lockfiles. CI/release validation should also

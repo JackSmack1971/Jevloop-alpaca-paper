@@ -28,7 +28,7 @@ in-place migration.
 
 ## Install as a Codex skill
 
-Place this directory at `$HOME/.agents/skills/jev-loop` or `<repo>/.agents/skills/jev-loop`. The bundled `agents/openai.yaml` disables implicit invocation because operational use can create paper-broker side effects; invoke it explicitly with `$jev-loop` when you want the workflow.
+Place this directory at `$HOME/.agents/skills/jev-loop` or `<repo>/.agents/skills/jev-loop`. The bundled `agents/openai.yaml` allows implicit routing to this workflow, but activation grants no broker authority: paper submission still requires explicit user intent, `--paper`, a ready canonical preflight, and permission under the environment policy. You can also invoke it explicitly with `$jev-loop`.
 
 Standalone setup:
 
