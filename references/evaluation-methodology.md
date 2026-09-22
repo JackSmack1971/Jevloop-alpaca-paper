@@ -13,7 +13,8 @@ Load this for calibration, threshold tuning, performance claims, or strategy com
 - Report proper scoring rules (multiclass Brier and log loss) alongside discrimination/accuracy; no one number establishes useful uncertainty.
 - Compare against a declared reference. This package reports both uniform and **sample-climatology** Brier references and uses a difference improvement, while labeling the same-sample climatology baseline as descriptive.
 - Retain top-label/equal-width ECE only as a diagnostic. Its result is sensitive to binning and top-label reduction; also report adaptive, classwise reliability using all class probabilities.
-- Preserve serial dependence when estimating uncertainty. The command uses a moving-block bootstrap and reports sensitivity across multiple block lengths; a single block choice is not treated as ground truth.
+- Preserve serial dependence when estimating uncertainty. The command uses a moving-block bootstrap and reports sensitivity across multiple block lengths; a single block choice is not treated as ground truth. This interval is available only for an explicitly selected symbol and a single cohort. Multi-symbol runs may report descriptive metrics with bootstrapping disabled, but never a pooled interval.
+- A hierarchical or symbol-stratified bootstrap is a future methodology decision requiring an explicit estimand and aggregation policy. It is not an implied capability of the current single-series bootstrap.
 - Report class counts/support. The output is always `DESCRIPTIVE_ONLY`; small or sparse classes add warnings rather than being converted into an arbitrary pass/fail readiness threshold.
 - Calibration consumes only complete schema-v3 evidence. Forecast and label must have
   the same symbol and the same declared run, data source, provider route, provider
