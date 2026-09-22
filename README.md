@@ -35,12 +35,19 @@ Standalone setup:
 ```bash
 cd jev-loop
 cp .env.example .env
-uv sync --group dev
+uv lock --check
+uv sync --locked --group dev
+uv run ruff check
 uv run pytest -q
 uv run python scripts/validate_package.py
+uv run python -m compileall -q jevloop scripts tests
 ```
 
-`uv.lock` is intentionally not fabricated in this artifact: dependency resolution was unavailable in the build environment. On a networked development machine, run `uv lock`, review the result, commit it, and use `uv sync --locked` in CI for reproducible installs.
+These are the same merge-blocking commands used by CI. The committed `uv.lock` supports
+Python 3.10 through 3.14; CI performs locked synchronization and byte-compilation on each
+version, while the deterministic, credential-free test suite runs once on Python 3.10 so
+provider-facing tests are not multiplied across the compatibility matrix. After changing
+`pyproject.toml`, run `uv lock` on a networked development machine and commit the updated lock.
 
 ## Safe first run
 

@@ -35,7 +35,7 @@ credential authority — those boundaries are enforced in the runtime, not in th
 Get evidence before changing behavior, and choose the narrowest mode that answers the
 request — offline `simulate`, real-data `run` with no orders, or explicit `run --paper`
 only when the user asked for paper side effects. For code changes: run focused tests,
-then `uv run pytest -q` and `uv run python scripts/validate_package.py`. Report
+then the complete command sequence in README.md (the same sequence CI runs). Report
 executed evidence exactly; anything not actually exercised here (credentials, network,
 live provider/broker behavior) is `UNVERIFIED_RUNTIME`, and simulation or mocks never
 substitute for it.

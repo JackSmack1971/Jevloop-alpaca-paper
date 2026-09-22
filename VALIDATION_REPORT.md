@@ -23,13 +23,13 @@ See `references/source-audit.md` for the full file-by-file disposition and `CHAN
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | **88 passed** (80 in 0.3.0, +8 new regression tests for this pass's fixes) |
-| `python scripts/validate_package.py` | **PACKAGE_VALIDATION_OK** (`files=50`, `python_files=30`) |
-| `python -m compileall -q jevloop scripts tests` | **passed** |
-| `python -m ruff check` (now executable; blocked in 0.3.0) | **28 pre-existing findings**, all pycodestyle E701/E702 "multiple statements on one line" in code that deliberately uses a condensed one-liner style (`MockDecisionClient` in `client.py`, and several test files) — no `F` (Pyflakes) findings remain anywhere in `jevloop/`, `scripts/`, or `tests/` after removing genuinely unused imports/locals this pass found. `[tool.ruff.lint] select` is now pinned so this is reproducible across ruff versions; left as pre-existing style, not rewritten, to avoid unjustified churn across files outside this audit's scope. |
+| `uv run pytest -q` | Runs the deterministic, credential-free regression suite in CI. |
+| `uv run python scripts/validate_package.py` | Checks package contracts plus lockfile presence/freshness and the required CI commands. |
+| `uv run python -m compileall -q jevloop scripts tests` | Runs in the quality job and across Python 3.10–3.14. |
+| `uv run ruff check` | Merge-blocking E4/E7/E9 and Pyflakes checks; the known E701/E702 findings have been reformatted rather than suppressed. |
 | Offline simulation, 130 ticks | **SIMULATION_OK** |
 | Calibration smoke on 127 synthetic/mock eligible observations | **DESCRIPTIVE_ONLY**, report emitted successfully |
-| `uv lock --offline` | **NOT RE-ATTEMPTED** — same network/cache constraint as 0.3.0; `uv.lock` is still intentionally not fabricated |
+| `uv lock --check` / `uv sync --locked --group dev` | Merge-blocking lock freshness and reproducible environment checks. |
 
 ### Calibration smoke evidence
 
@@ -81,7 +81,7 @@ All prior 0.3.0 regression coverage (live-URL refusal, ambiguous-POST reconcilia
 1. REST market/broker polling is seconds-scale and can observe state later than Alpaca websocket streams; event-driven migration should be tested for reconnect ordering, duplicate events, and backfill before adoption.
 2. An ambiguous POST that is not immediately visible by client ID still requires fail-closed operator reconciliation; the package deliberately stops rather than guessing.
 3. Session-scoped order ownership is a deliberate safety tradeoff (never auto-cancel an unrecognized order), not a bug, but it means a crashed/killed session's resting orders require manual reconciliation; `doctor`/`run` now surface this rather than staying silent about it.
-4. `uv.lock` should be generated and committed on a networked development machine, then CI should use `uv sync --locked`.
+4. Keep `uv.lock` synchronized with `pyproject.toml`; both the validator and CI reject a missing or stale lock.
 5. Calibration metrics remain sample- and regime-dependent; block choice, horizon, neutral band, class imbalance, and model-selection history must remain visible in any downstream claim.
 6. The Avellaneda–Stoikov helper is now mathematically correct against its cited source but is still not wired into the default pricing path and still requires venue-specific `gamma`/`kappa`/`sigma` estimation before any real use.
 
