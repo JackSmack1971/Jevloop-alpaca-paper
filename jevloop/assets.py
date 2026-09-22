@@ -3,6 +3,7 @@
 Ticker syntax is useful for choosing a market-data route offline. It is never
 proof that Alpaca currently supports or allows trading the asset.
 """
+
 from __future__ import annotations
 
 import re
@@ -48,6 +49,16 @@ def classify_symbol(raw: str) -> AssetSpec:
     )
 
 
+def alpaca_order_query_symbol(raw: str) -> str:
+    """Return Alpaca's symbol spelling for the account order-list endpoint.
+
+    Execution and market-data APIs use the canonical slash-delimited crypto pair,
+    while ``GET /v2/orders`` documents crypto filters without the slash.
+    """
+    spec = classify_symbol(raw)
+    return spec.symbol.replace("/", "") if spec.asset_class == "crypto" else spec.symbol
+
+
 def _decimal(value) -> Decimal | None:
     if value in (None, ""):
         return None
@@ -86,11 +97,14 @@ def require_tradable(spec: AssetSpec) -> None:
         raise AssetNotTradableError("asset is not currently marked tradable by Alpaca")
     if spec.asset_class == "crypto":
         missing = [
-            name for name in ("min_order_size", "min_trade_increment", "price_increment")
+            name
+            for name in ("min_order_size", "min_trade_increment", "price_increment")
             if getattr(spec, name) is None
         ]
         if missing:
-            raise AssetNotTradableError(f"crypto asset metadata missing execution increments: {missing}")
+            raise AssetNotTradableError(
+                f"crypto asset metadata missing execution increments: {missing}"
+            )
 
 
 def _quantize_up(value: Decimal, increment: Decimal) -> Decimal:
@@ -111,7 +125,9 @@ def quantity_for_notional(notional_usd: float, price: float, spec: AssetSpec) ->
     if notional_usd <= 0 or price <= 0:
         raise ValueError("notional and price must be positive")
     raw = Decimal(str(notional_usd)) / Decimal(str(price))
-    inc = spec.min_trade_increment or (Decimal("0.000000001") if spec.asset_class == "crypto" else Decimal("0.000000001"))
+    inc = spec.min_trade_increment or (
+        Decimal("0.000000001") if spec.asset_class == "crypto" else Decimal("0.000000001")
+    )
     qty = _quantize_up(raw, inc)
     if spec.min_order_size is not None:
         qty = max(qty, spec.min_order_size)
@@ -122,7 +138,9 @@ def quantize_price(price: float, spec: AssetSpec, *, side: str) -> float:
     if price <= 0:
         raise ValueError("price must be positive")
     # Alpaca equities reject sub-penny prices >= $1; crypto metadata is authoritative when present.
-    fallback = Decimal("0.01") if spec.asset_class == "us_equity" and price >= 1 else Decimal("0.0001")
+    fallback = (
+        Decimal("0.01") if spec.asset_class == "us_equity" and price >= 1 else Decimal("0.0001")
+    )
     inc = spec.price_increment or fallback
     value = Decimal(str(price))
     q = _quantize_down(value, inc) if side == "buy" else _quantize_up(value, inc)

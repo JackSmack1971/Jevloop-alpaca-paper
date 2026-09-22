@@ -1,4 +1,5 @@
 """Operational preflight: prove configuration, broker asset authority, and Jev response shape."""
+
 from __future__ import annotations
 
 import argparse
@@ -48,8 +49,12 @@ def _probe_state() -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jev-loop doctor")
     parser.add_argument("--symbol", default=os.getenv("DEFAULT_SYMBOL", "BTC/USD"))
-    parser.add_argument("--offline", action="store_true", help="syntax/import checks only; no runtime verification")
-    parser.add_argument("--mock", action="store_true", help="use mock only to test local battery plumbing")
+    parser.add_argument(
+        "--offline", action="store_true", help="syntax/import checks only; no runtime verification"
+    )
+    parser.add_argument(
+        "--mock", action="store_true", help="use mock only to test local battery plumbing"
+    )
     args = parser.parse_args(argv)
 
     print("jev-loop doctor")
@@ -69,7 +74,10 @@ def main(argv: list[str] | None = None) -> int:
     if result.account is not None:
         print(
             f"  paper account: status={result.account.get('status')} "
-            f"trading_blocked={bool(result.account.get('trading_blocked'))}"
+            f"crypto_status={result.account.get('crypto_status')} "
+            f"trading_blocked={result.account.get('trading_blocked')} "
+            f"account_blocked={result.account.get('account_blocked')} "
+            f"trade_suspended_by_user={result.account.get('trade_suspended_by_user')}"
         )
     for reason in result.reasons:
         print(f"  preflight: BLOCKED code={reason.code} message={reason.message}")
@@ -86,11 +94,18 @@ def main(argv: list[str] | None = None) -> int:
             f"latency_ms={meta.get('latency_ms')} questions={len(answers)}"
         )
         if client.name == "MOCK":
-            print("  note: mock proves local wiring only; it is not valid for broker-order execution")
+            print(
+                "  note: mock proves local wiring only; it is not valid for broker-order execution"
+            )
     except (DecisionClientError, DecisionSchemaError) as exc:
         print(f"  decision provider: BLOCKED: {exc}")
         return 2
 
+    print(
+        "  preflight: READY proves paper endpoint; selected-class account and asset "
+        "capability; complete selected-symbol open-order enumeration; no foreign "
+        "jevloop orders; and non-mock provider configuration"
+    )
     print("DOCTOR_OK")
     return 0
 
