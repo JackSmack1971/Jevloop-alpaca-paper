@@ -5,8 +5,10 @@ from __future__ import annotations
 import ast
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
@@ -25,10 +27,51 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret[_-]?key)\s*=\s*['\"]?[A-Za-z0-9_\-]{16,}"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
 ]
+CI_WORKFLOW = ".github/workflows/quality.yml"
+CI_COMMANDS = (
+    "uv lock --check",
+    "uv sync --locked --group dev",
+    "uv run ruff check",
+    "uv run pytest -q",
+    "uv run python scripts/validate_package.py",
+    "uv run python -m compileall -q jevloop scripts tests",
+)
 
 
 def fail(message: str, errors: list[str]) -> None:
     errors.append(message)
+
+
+def validate_delivery_files(
+    root: Path,
+    rels: set[str],
+    errors: list[str],
+    *,
+    lock_check: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    """Validate reproducible-install and CI contracts with actionable errors."""
+    if "uv.lock" not in rels:
+        fail("missing lockfile: uv.lock (run `uv lock` and commit the result)", errors)
+    else:
+        result = lock_check(
+            ["uv", "lock", "--check"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            suffix = f": {detail[-1]}" if detail else ""
+            fail(f"stale lockfile: uv.lock does not match pyproject.toml{suffix}", errors)
+
+    if CI_WORKFLOW not in rels:
+        fail(f"missing CI workflow: {CI_WORKFLOW}", errors)
+        return
+    workflow = (root / CI_WORKFLOW).read_text(encoding="utf-8")
+    for command in CI_COMMANDS:
+        if command not in workflow:
+            fail(f"CI workflow missing required command: {command}", errors)
 
 
 def main() -> int:
@@ -40,6 +83,7 @@ def main() -> int:
     missing = sorted(REQUIRED - rels)
     if missing:
         fail(f"missing required files: {missing}", errors)
+    validate_delivery_files(ROOT, rels, errors)
 
     for p in files:
         rel = p.relative_to(ROOT).as_posix()

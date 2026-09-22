@@ -1,4 +1,3 @@
-from pathlib import Path
 from jevloop.doctor import main as doctor_main
 from jevloop.serve import Handler
 from jevloop.simulate import main as simulate_main
