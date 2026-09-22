@@ -35,7 +35,7 @@ Standalone setup:
 ```bash
 cd jev-loop
 cp .env.example .env
-uv sync --locked --group dev
+uv sync --locked --dev
 uv run pytest -q
 uv run python scripts/validate_package.py
 ```
@@ -43,7 +43,29 @@ uv run python scripts/validate_package.py
 `uv.lock` records the reviewed Python 3.10+ runtime and development dependency graph.
 After changing `pyproject.toml`, regenerate it with the project's supported `uv` version
 and review the diff. Use `uv lock --check` to detect a stale lock without changing it,
-and use `uv sync --locked` (with `--group dev` for development) for reproducible installs.
+and use `uv sync --locked --dev` for reproducible development installs.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes and pull requests using Python 3.10, the
+minimum version declared in `pyproject.toml`. No additional Python versions are in
+the matrix because the repository does not currently make an explicit commitment
+to maintain them. The workflow grants only read access to repository contents,
+pins both third-party actions and uv, and does not inject broker or provider
+credentials. Its uv download cache is keyed from `uv.lock`; the cache cannot
+bypass the mandatory locked synchronization and lockfile freshness checks.
+
+CI runs this offline, side-effect-free contract through the locked development
+environment:
+
+```bash
+uv sync --locked --dev
+uv lock --check
+uv run python scripts/validate_package.py
+uv run python -m pytest -q
+uv run ruff check .
+uv run python -m compileall -q jevloop scripts evals tests
+```
 
 ## Safe first run
 

@@ -1,7 +1,23 @@
 # jev-loop 0.3.1 validation report
 
 **Date:** 2026-09-22
-**Scope:** research-verified full package audit (every module re-inspected, not a README pass), deterministic package validation, and offline end-to-end smoke tests. Authenticated Alpaca/TypeSafe/Vercel runtime behavior was not exercised in this artifact environment — see "Runtime evidence status" below.
+**Scope:** research-verified full package audit (every module re-inspected, not a README pass), deterministic package validation, offline end-to-end smoke tests, and the Python 3.10 CI contract. Authenticated Alpaca/TypeSafe/Vercel runtime behavior was not exercised in this artifact environment — see "Runtime evidence status" below.
+
+## CI contract
+
+The required GitHub Actions workflow runs for pushes and pull requests on Python
+3.10, the declared minimum and the only interpreter version the repository
+currently commits to maintaining. It uses immutable action SHAs, pins uv 0.7.22,
+grants only `contents: read`, and supplies no broker or provider credentials. The
+uv cache is keyed from `uv.lock`, while `uv sync --locked --dev` and
+`uv lock --check` remain mandatory gates, so a cache hit cannot accept a stale
+lockfile. Package validation, tests, Ruff, and byte-compilation all run through
+that locked environment and are expected to be offline and side-effect-free.
+
+Before making Ruff required, the 24 documented E701/E702 findings were resolved by
+expanding condensed statements without changing their ordering or assertions. The
+two documented unused test imports were also removed. The lint policy itself was
+not weakened, and no files were excluded.
 
 ## What this pass targeted
 
@@ -23,14 +39,14 @@ See `references/source-audit.md` for the full file-by-file disposition and `CHAN
 
 | Check | Result |
 |---|---|
-| `uv run pytest -q` | **172 passed** |
-| `uv run python scripts/validate_package.py` | **PACKAGE_VALIDATION_OK** (`files=157`, `python_files=39`) |
-| `uv run python -m compileall -q jevloop scripts tests` | **passed** |
+| `uv sync --locked --dev` | **passed**; resolved 17 packages and audited the 13-package environment from the lock |
+| `uv lock --check` | **passed**; resolved 17 packages and confirmed the lock is current |
+| `uv run python scripts/validate_package.py` | **PACKAGE_VALIDATION_OK** (`files=158`, `python_files=39`) |
+| `uv run python -m pytest -q` | **172 passed** |
+| `uv run ruff check .` | **passed**; all checks passed after resolving the documented E701/E702 findings and unused imports |
+| `uv run python -m compileall -q jevloop scripts evals tests` | **passed** |
 | `uv --version` | **uv 0.7.22** |
 | `uv lock` | **resolved 17 packages** using CPython 3.14.4; generated `uv.lock` for the declared Python `>=3.10` compatibility range |
-| `uv lock --check` | **passed**; resolved 17 packages and confirmed the lock is current |
-| `uv sync --locked` | **passed**; resolved 17 packages and installed 13 packages, including editable `jev-loop==0.3.1`, from the lock |
-| `uv run ruff check` | **26 pre-existing findings**: 24 pycodestyle E701/E702 "multiple statements on one line" findings in condensed code and 2 unused test imports (F401); left unchanged as outside this lockfile pass. |
 | Offline simulation, 130 ticks | **SIMULATION_OK** |
 | Calibration smoke on 127 synthetic/mock eligible observations | **DESCRIPTIVE_ONLY**, report emitted successfully |
 
