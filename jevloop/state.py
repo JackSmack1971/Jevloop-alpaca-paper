@@ -185,6 +185,8 @@ def build_snapshot(
         "last_10_latencies_ms": runtime.recent_latencies_ms[-10:],
         "last_10_slippage_bps": runtime.recent_slippage_bps[-10:],
         "data_age_s": round(max(0.0, as_of - market_data_ts), 3),
+        "quote_provider_ts": market_data_ts,
+        "trade_provider_ts": trade_data_ts,
         "trade_data_age_s": (
             round(max(0.0, as_of - trade_data_ts), 3) if trade_data_ts is not None else None
         ),

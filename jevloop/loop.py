@@ -25,6 +25,7 @@ from .execution.alpaca import (
     MarketClosedError,
     UnknownOrderOutcome,
 )
+from .evidence import EvidenceContext, serialize_record
 from .ladder import Rung, select_rung
 from .limits import Limits
 from .policy import KILL, PULL_QUOTES, QUOTE_BOTH_SIDES, QUOTE_WIDE, STAND_DOWN, WIDEN, compose_action, fallback_action
@@ -37,6 +38,8 @@ LOG_DIR = Path(os.getenv("JEV_LOOP_HOME", str(Path.home() / ".jev-loop")))
 LOG_FILE = LOG_DIR / "log.jsonl"
 LATEST_FILE = LOG_DIR / "latest.json"
 LATEST_WINDOW = 120
+_ACTIVE_EVIDENCE: EvidenceContext | None = None
+_ACTIVE_ALPACA = None
 
 
 class _StopRequested(Exception):
@@ -359,6 +362,7 @@ def run(
     dry_execution: bool,
     limits: Limits,
 ) -> int:
+    global _ACTIVE_EVIDENCE, _ACTIVE_ALPACA
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     preflight = paper_preflight(symbol=symbol, mock=mock)
     foreign_reasons = preflight.reasons_with_code(FOREIGN_SESSION_ORDERS)
@@ -383,6 +387,13 @@ def run(
     if decision_client.name == "MOCK" and not dry_execution:
         print("cannot start: mock judgments may not drive broker orders; add --dry-execution or use a real Jev provider")
         return 2
+
+    _ACTIVE_EVIDENCE = EvidenceContext.create(
+        runtime_mode="dry-real" if dry_execution else "paper-real",
+        data_source="alpaca-market-data", symbol=spec.symbol,
+        route=decision_client.name, model=decision_client.model, limits=limits,
+    )
+    _ACTIVE_ALPACA = alpaca
 
     print(f"asset verified by Alpaca: {spec.symbol} ({spec.asset_class}, status={spec.status}, tradable={spec.tradable})")
     print(f"decision client: {decision_client.name} / {decision_client.model}")
@@ -517,6 +528,8 @@ def run(
             meta = {"route": None, "model": None, "latency_ms": None}
             decision_late = False
             jev_down = False
+            decision_started_at = time.time()
+            decision_started_monotonic = time.monotonic()
             try:
                 answers, meta = run_battery(decision_client, snapshot, timeout=timeout)
                 runtime.recent_latencies_ms.append(float(meta["latency_ms"]))
@@ -525,6 +538,12 @@ def run(
                 decision_late = "deadline" in str(exc).lower()
                 jev_down = not decision_late
                 print(f"tick {block}: decision unavailable: {exc}")
+            finally:
+                meta["decision_started_at"] = decision_started_at
+                meta["decision_completed_at"] = time.time()
+                meta["decision_latency_monotonic_ms"] = round(
+                    (time.monotonic() - decision_started_monotonic) * 1000, 3
+                )
 
             action = None if decision_late else (fallback_action(snapshot, limits) if jev_down or answers is None else compose_action(answers, snapshot, limits))
             hard = risk_check(
@@ -655,8 +674,7 @@ def run(
 
 def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=None):
     direction_probs = answers.get("direction", {}).get("probabilities") if answers else None
-    return {
-        "schema_version": 2,
+    record = {
         "tick": block,
         "ts": now,
         "symbol": spec.symbol,
@@ -682,7 +700,21 @@ def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, 
         "latency_ms": meta.get("latency_ms") if meta else None,
         "route": meta.get("route") if meta else None,
         "model": meta.get("model") if meta else None,
+        "provider_route": meta.get("route") if meta else (_ACTIVE_EVIDENCE.provider_route if _ACTIVE_EVIDENCE else None),
+        "provider_model": meta.get("model") if meta else (_ACTIVE_EVIDENCE.provider_model if _ACTIVE_EVIDENCE else None),
+        "quote_provider_ts": snapshot.get("quote_provider_ts") if snapshot else None,
+        "trade_provider_ts": snapshot.get("trade_provider_ts") if snapshot else None,
+        "quote_data_age_s": snapshot.get("data_age_s") if snapshot else None,
+        "trade_data_age_s": snapshot.get("trade_data_age_s") if snapshot else None,
+        "decision_started_at": meta.get("decision_started_at") if meta else None,
+        "decision_completed_at": meta.get("decision_completed_at") if meta else None,
+        "decision_latency_monotonic_ms": meta.get("decision_latency_monotonic_ms") if meta else None,
     }
+    if _ACTIVE_EVIDENCE:
+        record.update(_ACTIVE_EVIDENCE.fields())
+    if _ACTIVE_ALPACA is not None and hasattr(_ACTIVE_ALPACA, "drain_request_evidence"):
+        record["broker_requests"] = _ACTIVE_ALPACA.drain_request_evidence()
+    return record
 
 
 def _append_reconciliation_record(
@@ -695,9 +727,12 @@ def _append_reconciliation_record(
     symbol: str,
 ) -> None:
     """Durably append abnormal-exit evidence without using replaceable latest state."""
+    broker_requests = []
+    if _ACTIVE_ALPACA is not None and hasattr(_ACTIVE_ALPACA, "drain_request_evidence"):
+        broker_requests = _ACTIVE_ALPACA.drain_request_evidence()
     _append_log(
         {
-            "schema_version": 2,
+            **(_ACTIVE_EVIDENCE.fields() if _ACTIVE_EVIDENCE else {"schema_version": 3}),
             "event": "paper_reconciliation",
             "kind": kind,
             "ts": time.time(),
@@ -709,6 +744,7 @@ def _append_reconciliation_record(
                 "traceback": failure_traceback,
             },
             "cleanup": reconciliation.as_dict(),
+            "broker_requests": broker_requests,
         }
     )
 
@@ -724,7 +760,7 @@ def _append_log(record: dict) -> None:
     unparseable trailing lines, so a torn last write degrades gracefully either way.
     """
     with LOG_FILE.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        fh.write(serialize_record(record) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -735,7 +771,7 @@ def _persist(record: dict, recent: list[dict], symbol: str, started_at: float) -
     del recent[:-LATEST_WINDOW]
     latencies = [x["latency_ms"] for x in recent if x.get("latency_ms") is not None]
     payload = {
-        "schema_version": 2,
+        **(_ACTIVE_EVIDENCE.fields() if _ACTIVE_EVIDENCE else {"schema_version": 3}),
         "generated_at": time.time(),
         "symbol": symbol,
         "ticks": recent,

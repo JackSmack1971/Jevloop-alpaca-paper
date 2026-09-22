@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
     "SKILL.md", "README.md", "CHANGELOG.md", "VALIDATION_REPORT.md", "pyproject.toml", ".env.example",
-    "jevloop/__main__.py", "jevloop/loop.py", "jevloop/execution/alpaca.py",
+    "jevloop/__main__.py", "jevloop/loop.py", "jevloop/evidence.py", "jevloop/execution/alpaca.py",
     "jevloop/calibrate.py", "jevloop/doctor.py", "jevloop/simulate.py",
     "references/provider-contracts.md", "references/architecture-and-safety.md",
     "references/evaluation-methodology.md", "references/live-trading.md",
@@ -144,6 +144,10 @@ def main() -> int:
     for required_text in ("mock judgments may not drive broker orders", "broker-reconciled inventory", "flatten verified by broker", "HOLD_BLOCKED"):
         if required_text not in loop:
             fail(f"loop missing evidence/safety mechanism: {required_text}", errors)
+    evidence = (ROOT / "jevloop/evidence.py").read_text(encoding="utf-8")
+    for required_text in ("SCHEMA_VERSION = 3", "PROCESS_RUN_ID", "validate_record", "serialize_record", "cohort_exclusion_reason"):
+        if required_text not in evidence:
+            fail(f"schema v3 evidence contract missing: {required_text}", errors)
 
     if errors:
         print("PACKAGE_VALIDATION_FAILED")

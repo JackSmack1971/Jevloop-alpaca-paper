@@ -14,6 +14,8 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+from .evidence import classify_loaded_record
+
 LOG_DIR = Path(os.getenv("JEV_LOOP_HOME", str(Path.home() / ".jev-loop")))
 LOG_FILE = LOG_DIR / "log.jsonl"
 CLASSES = ("up", "down", "neutral")
@@ -39,7 +41,7 @@ def load_ticks(path: Path = LOG_FILE) -> list[dict]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            rows.append(row)
+            rows.append(classify_loaded_record(row))
     return rows
 
 
@@ -66,7 +68,11 @@ def pair_observations(
     neutral_bps: float,
     include_mock: bool = False,
 ) -> list[Observation]:
-    rows = [r for r in ticks if r.get("mid") is not None and r.get("ts") is not None]
+    rows = [
+        r for r in ticks
+        if r.get("cohort_eligible", True)
+        and r.get("mid") is not None and r.get("ts") is not None
+    ]
     if symbol:
         rows = [r for r in rows if str(r.get("symbol", "")).upper() == symbol.upper()]
     groups: dict[str, list[dict]] = {}
