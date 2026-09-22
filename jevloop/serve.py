@@ -25,7 +25,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/latest.json":
             latest = LOG_DIR / "latest.json"
             if not latest.exists():
-                self._send_bytes(b'{"schema_version":2,"ticks":[],"stats":{}}', "application/json")
+                self._send_bytes(b'{"schema_version":3,"ticks":[],"stats":{}}', "application/json")
             else:
                 self._send_file(latest, "application/json")
             return

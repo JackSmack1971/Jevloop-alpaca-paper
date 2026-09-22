@@ -10,6 +10,22 @@
 
 It is a seconds-scale engineering/research scaffold, not exchange-grade HFT and not evidence of a profitable strategy.
 
+## Evidence log schema v3
+
+Both `run` and `simulate` write the same validated schema-v3 JSONL envelope. Each
+process has one immutable `run_id`; records identify package/Git versions, runtime
+mode and source, provider route/model, configuration digests, provider timestamps,
+data ages, wall-clock decision bounds, monotonic latency, and sanitized broker
+request correlation. Broker evidence connects Alpaca `X-Request-ID` values to the
+run, client/broker order identifiers, submissions, reconciliation reads,
+cancellation requests, and observed states. Authorization and credential fields are
+rejected by the serializer and are never copied from HTTP request headers.
+
+Older or malformed rows remain readable, but are marked `cohort_eligible=false`
+with a `cohort_exclusion_reason`; calibration excludes them from strict cohorts
+rather than silently mixing incomparable schemas. Existing v2 files do not need an
+in-place migration.
+
 ## Install as a Codex skill
 
 Place this directory at `$HOME/.agents/skills/jev-loop` or `<repo>/.agents/skills/jev-loop`. The bundled `agents/openai.yaml` disables implicit invocation because operational use can create paper-broker side effects; invoke it explicitly with `$jev-loop` when you want the workflow.
