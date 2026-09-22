@@ -12,30 +12,34 @@ import os
 import signal
 import sys
 import time
+import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
-from .assets import AssetSpec, AssetNotTradableError, quantize_quantity, quantity_for_notional
+from .assets import AssetSpec, quantize_quantity
 from .battery import run_battery
-from .client import DecisionClientError, resolve_decision_client
+from .client import DecisionClientError, DecisionLateResponseError, DecisionSchemaError
 from .execution.alpaca import (
     TERMINAL_ORDER_STATES,
     AlpacaAPIError,
-    AlpacaConfigError,
     MarketClosedError,
     UnknownOrderOutcome,
-    client_from_env,
 )
-from .ladder import Rung, select_rung
+from .evidence import EvidenceContext, serialize_record
+from .ladder import Rung
 from .limits import Limits
-from .policy import KILL, PULL_QUOTES, QUOTE_BOTH_SIDES, QUOTE_WIDE, STAND_DOWN, WIDEN, compose_action, fallback_action
-from .pricing import bounded_quote_prices
+from .policy import compose_action
+from .preflight import FOREIGN_SESSION_ORDERS, paper_preflight
 from .risk import check as risk_check
+from .reducer import TickIdentity, TickInput, reduce_tick
 from .state import RuntimeState, TradeTick, build_snapshot, observe_trades, record_fill_slippage
 
 LOG_DIR = Path(os.getenv("JEV_LOOP_HOME", str(Path.home() / ".jev-loop")))
 LOG_FILE = LOG_DIR / "log.jsonl"
 LATEST_FILE = LOG_DIR / "latest.json"
 LATEST_WINDOW = 120
+_ACTIVE_EVIDENCE: EvidenceContext | None = None
+_ACTIVE_ALPACA = None
 
 
 class _StopRequested(Exception):
@@ -92,26 +96,81 @@ def _owned_open_orders(alpaca) -> list[dict]:
     return [o for o in alpaca.get_open_orders() if alpaca.is_owned_order(o, alpaca.session_id)]
 
 
+@dataclass(frozen=True)
+class ReconciliationResult:
+    """Evidence from one ownership-scoped cancellation and broker verification."""
+
+    cancelled: int
+    cancel_error: str | None
+    verification_error: str | None
+    unresolved_orders: tuple[dict[str, str | None], ...]
+
+    @property
+    def verified(self) -> bool:
+        return self.verification_error is None and not self.unresolved_orders
+
+    def as_dict(self) -> dict:
+        return {
+            "cancelled": self.cancelled,
+            "cancel_error": self.cancel_error,
+            "verification_error": self.verification_error,
+            "verified": self.verified,
+            "unresolved_orders": list(self.unresolved_orders),
+        }
+
+
+def _reconcile_session_orders(alpaca, *, dry: bool, verify_attempts: int = 3) -> ReconciliationResult:
+    """Cancel only current-session orders, then independently verify broker state."""
+    if dry:
+        return ReconciliationResult(0, None, None, ())
+
+    cancelled = 0
+    cancel_error = None
+    try:
+        cancelled = len(alpaca.cancel_session_orders())
+    except BaseException as exc:  # Cleanup must never replace the failure being handled.
+        cancel_error = f"{type(exc).__name__}: {exc}"
+
+    remaining: list[dict] = []
+    verification_error = None
+    for attempt in range(max(1, verify_attempts)):
+        try:
+            remaining = _owned_open_orders(alpaca)
+        except BaseException as exc:  # Verification failure is distinct from cancellation failure.
+            verification_error = f"{type(exc).__name__}: {exc}"
+            break
+        if not remaining:
+            break
+        if attempt + 1 < verify_attempts:
+            time.sleep(0.1)
+
+    identities = tuple(
+        {
+            "id": str(order.get("id")) if order.get("id") is not None else None,
+            "client_order_id": (
+                str(order.get("client_order_id")) if order.get("client_order_id") is not None else None
+            ),
+        }
+        for order in remaining
+    )
+    return ReconciliationResult(cancelled, cancel_error, verification_error, identities)
+
+
 def _cancel_owned(alpaca, *, dry: bool, verify_attempts: int = 3) -> tuple[int, str | None]:
     """Cancel this session's orders and verify no owned open order remains.
 
     A cancellation request is not treated as a completed cancellation. Requoting and
     emergency flattening are blocked when broker reconciliation is incomplete.
     """
-    if dry:
-        return 0, None
-    try:
-        cancelled = alpaca.cancel_session_orders()
-        for attempt in range(max(1, verify_attempts)):
-            remaining = _owned_open_orders(alpaca)
-            if not remaining:
-                return len(cancelled), None
-            if attempt + 1 < verify_attempts:
-                time.sleep(0.1)
-        ids = [str(order.get("id")) for order in remaining if order.get("id")]
-        return len(cancelled), f"owned orders still open after cancellation: {ids}"
-    except AlpacaAPIError as exc:
-        return 0, str(exc)
+    result = _reconcile_session_orders(alpaca, dry=dry, verify_attempts=verify_attempts)
+    errors = []
+    if result.cancel_error:
+        errors.append(f"cancellation failed: {result.cancel_error}")
+    if result.verification_error:
+        errors.append(f"verification failed: {result.verification_error}")
+    if result.unresolved_orders:
+        errors.append(f"owned orders still open after cancellation: {list(result.unresolved_orders)}")
+    return result.cancelled, "; ".join(errors) or None
 
 
 def _refresh_order_statuses(alpaca, runtime: RuntimeState, pending_orders: dict[str, dict]) -> None:
@@ -169,130 +228,50 @@ def _flatten_if_needed(alpaca, spec: AssetSpec, runtime: RuntimeState, *, dry: b
     return f"flatten not verified; broker position remains {runtime.inventory_qty}"
 
 
-def _submit_quote_side(
-    alpaca,
-    *,
-    spec: AssetSpec,
-    side: str,
-    qty: float,
-    price: float,
-    snapshot: dict,
-    limits: Limits,
-    decision_latency_ms: float | None,
-    session_open_orders: int,
-    runtime: RuntimeState,
-    pending_orders: dict[str, dict],
-    dry: bool,
-) -> tuple[str, dict | None]:
-    notional = qty * price
-    signed = notional if side == "buy" else -notional
-    projected = snapshot["inventory_usd"] + signed
-    verdict = risk_check(
-        snapshot,
-        notional,
-        limits,
-        api_error_streak=runtime.api_error_streak,
-        decision_latency_ms=decision_latency_ms,
-        session_open_orders=session_open_orders,
-        projected_inventory_usd=projected,
-    )
-    if not verdict.ok:
-        return f"{side} vetoed: {verdict.veto}", None
-    if dry:
-        return f"dry {side} {qty:g} @ {price:g}", None
-    try:
-        order = alpaca.submit_limit_order(side=side, qty=qty, limit_price=price, spec=spec)
-        runtime.orders_submitted += 1
-        if order.get("id"):
-            pending_orders[str(order["id"])] = {"side": side, "expected_price": price}
-        return f"submitted {side} {qty:g} @ {price:g} id={order.get('id')}", order
-    except (AlpacaAPIError, MarketClosedError) as exc:
-        runtime.orders_rejected += 1
-        return f"{side} submission failed: {exc}", None
-
-
-def _execute_action(
-    *,
-    alpaca,
-    spec: AssetSpec,
-    action,
-    snapshot: dict,
-    limits: Limits,
-    decision_latency_ms: float | None,
-    rest_counter: int,
-    runtime: RuntimeState,
-    pending_orders: dict[str, dict],
-    dry: bool,
-) -> tuple[str, int]:
-    if action.kind in {PULL_QUOTES, STAND_DOWN}:
-        count, error = _cancel_owned(alpaca, dry=dry)
-        return f"{action.kind}; canceled={count}" + (f"; cancel_error={error}" if error else ""), 0
-
-    if action.kind not in {QUOTE_BOTH_SIDES, QUOTE_WIDE, WIDEN}:
-        return action.kind, rest_counter
-
-    rest_counter += 1
-    owned = [] if dry else _owned_open_orders(alpaca)
-    if owned and rest_counter < limits.quote_rest_ticks:
-        return f"{action.kind}; resting {len(owned)} owned order(s)", rest_counter
-
-    canceled, cancel_error = _cancel_owned(alpaca, dry=dry)
-    if cancel_error:
-        return f"{action.kind}; requote blocked: {cancel_error}; canceled={canceled}", 0
-    wide = action.kind in {QUOTE_WIDE, WIDEN}
-    bid_px, ask_px = bounded_quote_prices(
-        mid=snapshot["mid"],
-        best_bid=snapshot["best_bid"],
-        best_ask=snapshot["best_ask"],
-        inventory_utilization=snapshot["inventory_utilization"] or 0.0,
-        limits=limits,
-        spec=spec,
-        wide=wide,
-    )
-    quote_notional = limits.quote_notional_usd
-    buy_qty = quantity_for_notional(quote_notional, bid_px, spec)
+def _apply_intentions(*, decision, alpaca, spec, runtime, pending_orders, dry):
+    """Runtime-only adapter from inert reducer intentions to Alpaca operations."""
+    if not dry and decision.identity.runtime_mode != "paper-real":
+        raise PermissionError("only paper-real decisions may reach the paper-order adapter")
     messages: list[str] = []
-    msg, buy_order = _submit_quote_side(
-        alpaca,
-        spec=spec,
-        side="buy",
-        qty=buy_qty,
-        price=bid_px,
-        snapshot=snapshot,
-        limits=limits,
-        decision_latency_ms=decision_latency_ms,
-        session_open_orders=0,
-        runtime=runtime,
-        pending_orders=pending_orders,
-        dry=dry,
-    )
-    messages.append(msg)
-    open_count = 1 if buy_order else 0
+    for effect in decision.effects:
+        intent = effect.intent
+        if intent.kind == "cancel_owned":
+            count, error = _cancel_owned(alpaca, dry=dry)
+            messages.append(f"canceled={count}" + (f"; cancel_error={error}" if error else ""))
+            if error:
+                return "; ".join(messages) + "; subsequent intentions blocked"
+        elif intent.kind == "flatten":
+            try:
+                messages.append(_flatten_if_needed(alpaca, spec, runtime, dry=dry))
+            except (AlpacaAPIError, MarketClosedError) as exc:
+                messages.append(f"flatten attempt failed or became ambiguous: {exc}")
+        elif intent.kind == "limit_order":
+            assert (
+                intent.side is not None
+                and intent.quantity is not None
+                and intent.limit_price is not None
+            )
+            if dry:
+                messages.append(f"dry {intent.side} {intent.quantity:g} @ {intent.limit_price:g}")
+                continue
+            try:
+                order = alpaca.submit_limit_order(
+                    side=intent.side, qty=intent.quantity, limit_price=intent.limit_price, spec=spec
+                )
+                runtime.orders_submitted += 1
+                if order.get("id"):
+                    pending_orders[str(order["id"])] = {
+                        "side": intent.side,
+                        "expected_price": intent.limit_price,
+                    }
+                messages.append(
+                    f"submitted {intent.side} {intent.quantity:g} @ {intent.limit_price:g} id={order.get('id')}"
+                )
+            except (AlpacaAPIError, MarketClosedError) as exc:
+                runtime.orders_rejected += 1
+                messages.append(f"{intent.side} submission failed: {exc}")
+    return "; ".join(messages) or f"{decision.action_name}; resting owned order(s)"
 
-    # Cash/spot invariant: never create a naked sell. Only quote inventory already held.
-    available_sell = max(0.0, snapshot["inventory_qty"])
-    sell_qty = quantize_quantity(min(quantity_for_notional(quote_notional, ask_px, spec), available_sell), spec)
-    if spec.min_order_size is not None and sell_qty < float(spec.min_order_size):
-        sell_qty = 0.0
-    if sell_qty > 0:
-        msg, _ = _submit_quote_side(
-            alpaca,
-            spec=spec,
-            side="sell",
-            qty=sell_qty,
-            price=ask_px,
-            snapshot=snapshot,
-            limits=limits,
-            decision_latency_ms=decision_latency_ms,
-            session_open_orders=open_count,
-            runtime=runtime,
-            pending_orders=pending_orders,
-            dry=dry,
-        )
-        messages.append(msg)
-    else:
-        messages.append("sell skipped: no broker-reconciled inventory")
-    return "; ".join(messages), 0
 
 
 def run(
@@ -303,35 +282,42 @@ def run(
     dry_execution: bool,
     limits: Limits,
 ) -> int:
+    global _ACTIVE_EVIDENCE, _ACTIVE_ALPACA
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        alpaca = client_from_env(symbol=symbol)
-        spec = alpaca.load_asset_spec()
-        decision_client = resolve_decision_client(mock=mock)
-    except (AlpacaConfigError, AlpacaAPIError, AssetNotTradableError, DecisionClientError) as exc:
-        print(f"cannot start: {exc}")
+    preflight = paper_preflight(symbol=symbol, mock=mock)
+    foreign_reasons = preflight.reasons_with_code(FOREIGN_SESSION_ORDERS)
+    if not dry_execution and not preflight.ready:
+        for reason in preflight.reasons:
+            print(f"PREFLIGHT_BLOCKED code={reason.code} message={reason.message}")
+        return 2
+
+    # Dry mode remains an inspection path. It may continue where the existing runtime
+    # dependencies are usable, and reports foreign ownership as machine-readable data.
+    if foreign_reasons:
+        for reason in foreign_reasons:
+            print(json.dumps({"event": "paper_preflight_warning", "code": reason.code, "details": reason.details}))
+    alpaca = preflight.alpaca
+    spec = preflight.asset
+    decision_client = preflight.decision_client
+    if alpaca is None or spec is None or decision_client is None:
+        for reason in preflight.reasons:
+            print(f"cannot start: [{reason.code}] {reason.message}")
         return 2
 
     if decision_client.name == "MOCK" and not dry_execution:
         print("cannot start: mock judgments may not drive broker orders; add --dry-execution or use a real Jev provider")
         return 2
 
+    _ACTIVE_EVIDENCE = EvidenceContext.create(
+        runtime_mode="dry-real" if dry_execution else "paper-real",
+        data_source="alpaca-market-data", symbol=spec.symbol,
+        route=decision_client.name, model=decision_client.model, limits=limits,
+    )
+    _ACTIVE_ALPACA = alpaca
+
     print(f"asset verified by Alpaca: {spec.symbol} ({spec.asset_class}, status={spec.status}, tradable={spec.tradable})")
     print(f"decision client: {decision_client.name} / {decision_client.model}")
     print("execution: " + ("DRY (no orders)" if dry_execution else "PAPER (explicit --paper)"))
-    try:
-        foreign = alpaca.get_foreign_session_open_orders()
-        if foreign:
-            ids = [str(o.get("id")) for o in foreign]
-            print(
-                f"NOTICE: {len(foreign)} open order(s) carry this package's client-order "
-                f"prefix but belong to a different session (ids={ids}); this session will not "
-                "auto-cancel them, they are likely resting from a prior run that did not shut "
-                "down cleanly, and they need manual/operator reconciliation via the broker."
-            )
-    except AlpacaAPIError as exc:
-        print(f"NOTICE: could not check for prior-session orders: {exc}")
-
     runtime = RuntimeState()
     trade_history: list[TradeTick] = []
     recent_records: list[dict] = []
@@ -346,6 +332,11 @@ def run(
     except (ValueError, AttributeError, OSError):
         pass
 
+    # PAPER AUTHORITY ACTIVATION POINT: after preflight and dependency validation,
+    # immediately before entering the abnormal-exit boundary. From this statement
+    # onward the loop may mutate the paper account, and every abnormal exit is
+    # ownership-scoped, broker-verified, and durably evidenced.
+    paper_authority_active = not dry_execution
     try:
         while ticks is None or n < ticks:
             tick_start = time.monotonic()
@@ -454,95 +445,113 @@ def run(
             elapsed = time.monotonic() - tick_start
             timeout = max(0.05, limits.tick_seconds - elapsed - 0.15)
             answers = None
-            meta = {"route": None, "model": None, "latency_ms": None}
+            meta = {
+                "route": None, "model": None, "latency_ms": None,
+                "decision_deadline_s": timeout,
+                "decision_transport_latency_ms": None,
+                "late_response_disposition": None,
+            }
             decision_late = False
             jev_down = False
+            decision_started_at = time.time()
+            decision_started_monotonic = time.monotonic()
             try:
-                answers, meta = run_battery(decision_client, snapshot, timeout=timeout)
+                answers, response_meta = run_battery(decision_client, snapshot, timeout=timeout)
+                meta.update(response_meta)
                 runtime.recent_latencies_ms.append(float(meta["latency_ms"]))
                 runtime.recent_latencies_ms = runtime.recent_latencies_ms[-10:]
-            except (DecisionClientError, ValueError, KeyError, TypeError) as exc:
-                decision_late = "deadline" in str(exc).lower()
-                jev_down = not decision_late
+            except DecisionLateResponseError as exc:
+                decision_late = True
+                meta["decision_deadline_s"] = exc.configured_deadline_s
+                meta["decision_transport_latency_ms"] = exc.measured_latency_ms
+                meta["latency_ms"] = exc.measured_latency_ms
+                meta["late_response_disposition"] = exc.disposition
                 print(f"tick {block}: decision unavailable: {exc}")
-
-            action = None if decision_late else (fallback_action(snapshot, limits) if jev_down or answers is None else compose_action(answers, snapshot, limits))
-            hard = risk_check(
-                snapshot,
-                0.0,
-                limits,
-                api_error_streak=runtime.api_error_streak,
-                decision_latency_ms=meta.get("latency_ms"),
-                session_open_orders=0,
-            )
-            conf = answers.get("quote_environment", {}).get("confidence") if answers else None
-            execution_health = answers.get("execution_health", {}).get("score") if answers else None
-            rung = select_rung(
-                risk_kill=hard.kill or (action is not None and action.kind == KILL),
-                decision_late=decision_late,
-                jev_down=jev_down,
-                decision_confidence=conf,
-                low_confidence_threshold=limits.low_confidence_threshold,
-                execution_health_score=execution_health,
-                execution_health_floor=limits.execution_health_floor,
-                risk_ok=hard.ok,
-            )
-
-            if rung == Rung.KILL:
-                canceled, cancel_error = _cancel_owned(alpaca, dry=dry_execution)
-                if cancel_error:
-                    execution = (
-                        f"KILL; flatten blocked because cancellation could not be verified; "
-                        f"canceled={canceled}; cancel_error={cancel_error}; manual broker reconciliation required"
+            except (DecisionClientError, DecisionSchemaError) as exc:
+                jev_down = True
+                print(f"tick {block}: decision unavailable: {exc}")
+            finally:
+                meta["decision_started_at"] = decision_started_at
+                meta["decision_completed_at"] = time.time()
+                meta["decision_latency_monotonic_ms"] = round(
+                    (time.monotonic() - decision_started_monotonic) * 1000, 3
+                )
+                if meta["decision_transport_latency_ms"] is None:
+                    meta["decision_transport_latency_ms"] = meta["decision_latency_monotonic_ms"]
+                if meta["late_response_disposition"] is None:
+                    meta["late_response_disposition"] = (
+                        "accepted_on_time" if answers is not None else "no_response"
                     )
-                else:
-                    try:
-                        execution = _flatten_if_needed(alpaca, spec, runtime, dry=dry_execution)
-                    except (AlpacaAPIError, MarketClosedError, UnknownOrderOutcome) as exc:
-                        execution = f"flatten attempt failed or became ambiguous: {exc}"
-                action_name = "KILL"
-            elif rung in {Rung.HOLD_LATE, Rung.HOLD_BLOCKED, Rung.RULES_ONLY} or action is None:
+
+            identity = TickIdentity(
+                run_id=_ACTIVE_EVIDENCE.run_id,
+                runtime_mode=_ACTIVE_EVIDENCE.runtime_mode,
+                data_source=_ACTIVE_EVIDENCE.data_source,
+                symbol=_ACTIVE_EVIDENCE.symbol,
+                provider_route=meta.get("route") or _ACTIVE_EVIDENCE.provider_route,
+                provider_model=meta.get("model") or _ACTIVE_EVIDENCE.provider_model,
+            )
+            owned_count = 0 if dry_execution else len(_owned_open_orders(alpaca))
+            decision = reduce_tick(
+                TickInput(
+                    identity=identity,
+                    snapshot=snapshot,
+                    answers=answers,
+                    asset=spec,
+                    limits=limits,
+                    api_error_streak=runtime.api_error_streak,
+                    decision_latency_ms=meta.get("latency_ms"),
+                    decision_late=decision_late,
+                    provider_down=jev_down,
+                    owned_open_orders=owned_count,
+                    rest_counter=rest_counter,
+                ),
+                compose=compose_action,
+            )
+            action, rung, action_name = decision.action, decision.rung, decision.action_name
+            rest_counter = decision.rest_counter
+            try:
+                execution = _apply_intentions(
+                    decision=decision,
+                    alpaca=alpaca,
+                    spec=spec,
+                    runtime=runtime,
+                    pending_orders=pending_orders,
+                    dry=dry_execution,
+                )
+                if rung == Rung.HOLD_BLOCKED:
+                    execution = f"risk veto: {decision.risk.veto}; " + execution
+                elif rung in {Rung.HOLD_LATE, Rung.RULES_ONLY}:
+                    execution = "no new orders; " + execution
+            except UnknownOrderOutcome as exc:
                 count, error = _cancel_owned(alpaca, dry=dry_execution)
-                execution = f"no new orders; canceled={count}" + (f"; cancel_error={error}" if error else "")
-                if rung == Rung.HOLD_LATE:
-                    action_name = "HOLD_LATE"
-                elif rung == Rung.HOLD_BLOCKED:
-                    action_name = "RISK_BLOCK"
-                    execution = f"risk veto: {hard.veto}; " + execution
-                else:
-                    action_name = action.kind if action else "STAND_DOWN"
-            else:
-                effective_limits = limits
-                if rung == Rung.REDUCE:
-                    from dataclasses import replace
-                    effective_limits = replace(limits, quote_notional_usd=limits.quote_notional_usd * limits.reduce_size_factor)
                 try:
-                    execution, rest_counter = _execute_action(
-                        alpaca=alpaca,
-                        spec=spec,
-                        action=action,
-                        snapshot=snapshot,
-                        limits=effective_limits,
-                        decision_latency_ms=meta.get("latency_ms"),
-                        rest_counter=rest_counter,
-                        runtime=runtime,
-                        pending_orders=pending_orders,
-                        dry=dry_execution,
+                    _sync_account(alpaca, runtime, time.time())
+                except AlpacaAPIError as sync_exc:
+                    error = (
+                        f"{error}; account_sync={sync_exc}" if error else f"account_sync={sync_exc}"
                     )
-                    action_name = action.kind
-                except UnknownOrderOutcome as exc:
-                    count, error = _cancel_owned(alpaca, dry=dry_execution)
-                    try:
-                        _sync_account(alpaca, runtime, time.time())
-                    except AlpacaAPIError as sync_exc:
-                        error = f"{error}; account_sync={sync_exc}" if error else f"account_sync={sync_exc}"
-                    rung = Rung.HOLD_BLOCKED
-                    action_name = "UNKNOWN_ORDER_OUTCOME"
-                    execution = f"{exc}; canceled={count}" + (f"; reconciliation_error={error}" if error else "")
-                    record = _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=action_name)
-                    _persist(record, recent_records, spec.symbol, started_at)
-                    print(f"tick {block}: {action_name} | rung={rung.value} | {execution}")
-                    return 3
+                rung = Rung.HOLD_BLOCKED
+                action_name = "UNKNOWN_ORDER_OUTCOME"
+                execution = f"{exc}; canceled={count}" + (
+                    f"; reconciliation_error={error}" if error else ""
+                )
+                record = _record(
+                    block,
+                    now,
+                    spec,
+                    snapshot,
+                    answers,
+                    meta,
+                    action,
+                    rung,
+                    execution,
+                    runtime,
+                    action_name=action_name,
+                )
+                _persist(record, recent_records, spec.symbol, started_at)
+                print(f"tick {block}: {action_name} | rung={rung.value} | {execution}")
+                return 3
 
             record = _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=action_name)
             _persist(record, recent_records, spec.symbol, started_at)
@@ -552,19 +561,50 @@ def run(
                 return 3 if runtime.inventory_qty != 0 and not dry_execution else 0
             _sleep_remaining(tick_start, limits.tick_seconds)
         return 0
-    except (KeyboardInterrupt, _StopRequested):
-        count, error = _cancel_owned(alpaca, dry=dry_execution)
-        print(f"stopping; canceled {count} session-owned order(s)" + (f"; error={error}" if error else ""))
-        return 0
+    except (KeyboardInterrupt, _StopRequested) as exc:
+        reconciliation = _reconcile_session_orders(alpaca, dry=dry_execution)
+        _append_reconciliation_record(
+            kind="stop",
+            original_failure=exc,
+            failure_traceback=traceback.format_exc(),
+            reconciliation=reconciliation,
+            paper_authority_active=paper_authority_active,
+            symbol=spec.symbol,
+        )
+        print(
+            f"stopping; canceled {reconciliation.cancelled} session-owned order(s); "
+            f"verified={reconciliation.verified}"
+        )
+        return 0 if reconciliation.verified else 3
+    except Exception as exc:
+        # Bare `raise` below retains the original exception object and traceback.
+        # Cleanup and evidence failures are attached as notes rather than replacing it.
+        original_traceback = traceback.format_exc()
+        reconciliation = _reconcile_session_orders(alpaca, dry=dry_execution)
+        try:
+            _append_reconciliation_record(
+                kind="unexpected_failure",
+                original_failure=exc,
+                failure_traceback=original_traceback,
+                reconciliation=reconciliation,
+                paper_authority_active=paper_authority_active,
+                symbol=spec.symbol,
+            )
+        except BaseException as evidence_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"failed to durably record reconciliation evidence: {evidence_exc!r}")
+        raise
     finally:
         if previous_sigterm is not None:
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except (ValueError, AttributeError, OSError):
+                pass
 
 
 def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=None):
     direction_probs = answers.get("direction", {}).get("probabilities") if answers else None
-    return {
-        "schema_version": 2,
+    record = {
         "tick": block,
         "ts": now,
         "symbol": spec.symbol,
@@ -590,7 +630,56 @@ def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, 
         "latency_ms": meta.get("latency_ms") if meta else None,
         "route": meta.get("route") if meta else None,
         "model": meta.get("model") if meta else None,
+        "provider_route": meta.get("route") if meta else (_ACTIVE_EVIDENCE.provider_route if _ACTIVE_EVIDENCE else None),
+        "provider_model": meta.get("model") if meta else (_ACTIVE_EVIDENCE.provider_model if _ACTIVE_EVIDENCE else None),
+        "quote_provider_ts": snapshot.get("quote_provider_ts") if snapshot else None,
+        "trade_provider_ts": snapshot.get("trade_provider_ts") if snapshot else None,
+        "quote_data_age_s": snapshot.get("data_age_s") if snapshot else None,
+        "trade_data_age_s": snapshot.get("trade_data_age_s") if snapshot else None,
+        "decision_started_at": meta.get("decision_started_at") if meta else None,
+        "decision_completed_at": meta.get("decision_completed_at") if meta else None,
+        "decision_latency_monotonic_ms": meta.get("decision_latency_monotonic_ms") if meta else None,
+        "decision_deadline_s": meta.get("decision_deadline_s") if meta else None,
+        "decision_transport_latency_ms": meta.get("decision_transport_latency_ms") if meta else None,
+        "late_response_disposition": meta.get("late_response_disposition") if meta else None,
     }
+    if _ACTIVE_EVIDENCE:
+        record.update(_ACTIVE_EVIDENCE.fields())
+    if _ACTIVE_ALPACA is not None and hasattr(_ACTIVE_ALPACA, "drain_request_evidence"):
+        record["broker_requests"] = _ACTIVE_ALPACA.drain_request_evidence()
+    return record
+
+
+def _append_reconciliation_record(
+    *,
+    kind: str,
+    original_failure: BaseException,
+    failure_traceback: str,
+    reconciliation: ReconciliationResult,
+    paper_authority_active: bool,
+    symbol: str,
+) -> None:
+    """Durably append abnormal-exit evidence without using replaceable latest state."""
+    broker_requests = []
+    if _ACTIVE_ALPACA is not None and hasattr(_ACTIVE_ALPACA, "drain_request_evidence"):
+        broker_requests = _ACTIVE_ALPACA.drain_request_evidence()
+    _append_log(
+        {
+            **(_ACTIVE_EVIDENCE.fields() if _ACTIVE_EVIDENCE else {"schema_version": 3}),
+            "event": "paper_reconciliation",
+            "kind": kind,
+            "ts": time.time(),
+            "symbol": symbol,
+            "paper_authority_active": paper_authority_active,
+            "original_failure": {
+                "type": type(original_failure).__name__,
+                "message": str(original_failure),
+                "traceback": failure_traceback,
+            },
+            "cleanup": reconciliation.as_dict(),
+            "broker_requests": broker_requests,
+        }
+    )
 
 
 def _append_log(record: dict) -> None:
@@ -604,7 +693,7 @@ def _append_log(record: dict) -> None:
     unparseable trailing lines, so a torn last write degrades gracefully either way.
     """
     with LOG_FILE.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        fh.write(serialize_record(record) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -615,7 +704,7 @@ def _persist(record: dict, recent: list[dict], symbol: str, started_at: float) -
     del recent[:-LATEST_WINDOW]
     latencies = [x["latency_ms"] for x in recent if x.get("latency_ms") is not None]
     payload = {
-        "schema_version": 2,
+        **(_ACTIVE_EVIDENCE.fields() if _ACTIVE_EVIDENCE else {"schema_version": 3}),
         "generated_at": time.time(),
         "symbol": symbol,
         "ticks": recent,

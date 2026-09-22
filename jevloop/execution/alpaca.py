@@ -16,6 +16,7 @@ import requests
 
 from ..assets import AssetSpec, classify_symbol, from_alpaca_asset, require_tradable
 from ..state import TradeTick, parse_rfc3339
+from ..evidence import PROCESS_RUN_ID
 
 PAPER_TRADING_BASE_URL = "https://paper-api.alpaca.markets"
 LIVE_TRADING_BASE_URL = "https://api.alpaca.markets"
@@ -33,8 +34,8 @@ TERMINAL_ORDER_STATES = {"filled", "canceled", "expired", "rejected"}
 # It stays tracked, stays a cancellation candidate, and keeps being polled.
 PAUSED_UNTIL_NEXT_SESSION_STATES = {"done_for_day"}
 # A connect timeout of ~3.05s (slightly above the default TCP retransmission window)
-# bounds how long a hung connection attempt can block a single call; the read timeout
-# stays fully configurable via `timeout_s` so slow-but-live responses are not cut off.
+# is a socket inactivity limit, not hard cancellation. The read timeout stays fully
+# configurable via `timeout_s` so slow-but-live responses are not cut off.
 _CONNECT_TIMEOUT_S = 3.05
 
 
@@ -130,8 +131,27 @@ class AlpacaClient:
         self._client_seq = 0
         self._owned_client_order_ids: set[str] = set()
         self._clock_cache: tuple[float, dict] | None = None
+        self.run_id = PROCESS_RUN_ID
+        self._request_evidence: list[dict] = []
 
     def _request(self, method: str, url: str, **kwargs):
+        started = time.time()
+        body = kwargs.get("json") if isinstance(kwargs.get("json"), dict) else {}
+        event = {
+            "run_id": self.run_id,
+            "method": method.upper(),
+            "resource": url.split("?", 1)[0].rsplit("/", 2)[-2:],
+            "request_started_at": started,
+            "client_order_id": body.get("client_order_id") or (kwargs.get("params") or {}).get("client_order_id"),
+            "operation": (
+                "submission" if method.upper() == "POST" and url.endswith("/v2/orders")
+                else "cancellation" if method.upper() == "DELETE"
+                else "reconciliation_read" if "/orders" in url
+                else "provider_read"
+            ),
+        }
+        if "/orders/" in url:
+            event["order_id"] = url.rstrip("/").rsplit("/", 1)[-1]
         try:
             response = requests.request(
                 method,
@@ -141,7 +161,23 @@ class AlpacaClient:
                 **kwargs,
             )
         except requests.RequestException as exc:
+            event.update({"request_completed_at": time.time(), "status_code": 0, "request_id": None})
+            self._request_evidence.append(event)
             raise AlpacaAPIError(0, f"transport failure: {exc}") from exc
+        request_id = response.headers.get("X-Request-ID") or response.headers.get("x-request-id")
+        event.update({
+            "request_completed_at": time.time(), "status_code": response.status_code,
+            "request_id": request_id,
+        })
+        try:
+            payload = response.json() if response.text else {}
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            event["order_id"] = payload.get("id") or event.get("order_id")
+            event["broker_state"] = payload.get("status")
+            event["client_order_id"] = event["client_order_id"] or payload.get("client_order_id")
+        self._request_evidence.append(event)
         if response.status_code >= 400:
             retry_after = response.headers.get("Retry-After")
             try:
@@ -151,10 +187,14 @@ class AlpacaClient:
             raise AlpacaAPIError(response.status_code, response.text, retry_after_s=retry_after_s)
         if not response.text:
             return {}
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise AlpacaAPIError(response.status_code, "provider returned invalid JSON") from exc
+        if payload is None:
+            raise AlpacaAPIError(response.status_code, "provider returned invalid JSON")
+        return payload
+
+    def drain_request_evidence(self) -> list[dict]:
+        """Return and clear sanitized HTTP correlation metadata."""
+        events, self._request_evidence = self._request_evidence, []
+        return events
 
     def get_asset(self) -> dict:
         encoded = quote(self.symbol, safe="")

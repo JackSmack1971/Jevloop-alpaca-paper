@@ -15,9 +15,9 @@ credential authority — those boundaries are enforced in the runtime, not in th
 ## Non-negotiable invariants
 
 - Code owns timestamps, features, policy composition, sizing, risk, order ownership, and broker reconciliation. Jev answers only the seven bounded questions in `jevloop/battery.py`.
-- Runtime default is **dry execution**. Paper order submission requires the user's explicit request and `--paper`; mock judgments can never drive orders.
+- Runtime default is **dry execution**. Implicit Skill activation grants no broker authority: paper order submission independently requires the user's explicit intent, `--paper`, a ready canonical paper preflight, and permission under the environment policy; mock judgments can never drive orders.
 - Live-money execution is not a capability of this package. Do not add a live endpoint, credential gate, or hidden override as part of ordinary operation.
-- Before paper orders, run `uv run jev-loop doctor --symbol <SYMBOL>` and require broker-authenticated `status=active` and `tradable=true`.
+- `run --paper` enforces the canonical broker, asset, provider, and order-ownership preflight before paper authority is activated. `doctor` is an independent inspection command that displays the same readiness result; invoking the Skill or running `doctor` does not grant authorization.
 - Use provider timestamps and broker state. Never infer a fill from submission, fabricate state, or let fresh trade events mask stale pricing quotes/order books.
 - On stale/invalid state, late/invalid Jev output, unresolved risk veto, provider failure, cancellation uncertainty, or ambiguous order outcome: fail closed, place no new orders, and reconcile session-owned orders.
 - Never use account-wide cancellation. A KILL flatten may proceed only after session-owned resting-order cancellation is broker-verifiably clear. Order ownership is scoped to the current process session; `doctor` and `run` surface — but never auto-cancel — orders left open by a prior, uncleanly-ended session.

@@ -11,8 +11,12 @@ import json
 import math
 import os
 import random
+from collections import Counter
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from .evidence import classify_loaded_record
 
 LOG_DIR = Path(os.getenv("JEV_LOOP_HOME", str(Path.home() / ".jev-loop")))
 LOG_FILE = LOG_DIR / "log.jsonl"
@@ -20,10 +24,68 @@ CLASSES = ("up", "down", "neutral")
 
 
 @dataclass(frozen=True)
+class CohortIdentity:
+    run_id: str
+    data_source: str
+    provider_route: str
+    provider_model: str
+    strategy_config_digest: str
+    limits_digest: str
+    battery_schema_digest: str
+
+
+@dataclass(frozen=True)
 class Observation:
     probs: dict[str, float]
     outcome: str
     ts: float
+    symbol: str
+    cohort_identity: CohortIdentity
+    requested_horizon_seconds: float = 0.0
+    actual_label_lag_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        symbol = self.symbol.strip().upper()
+        if not symbol:
+            raise ValueError("observation symbol must be non-empty")
+        object.__setattr__(self, "symbol", symbol)
+
+
+EXCLUSION_REASONS = (
+    "legacy_schema",
+    "source_mismatch",
+    "cohort_mismatch",
+    "stale_label",
+    "excessive_lag",
+    "missing_timestamps",
+)
+REAL_PRICING_SOURCES = frozenset({"alpaca-market-data"})
+COHORT_FIELDS = (
+    "run_id",
+    "data_source",
+    "provider_route",
+    "provider_model",
+    "strategy_config_digest",
+    "limits_digest",
+    "battery_schema_digest",
+)
+
+
+@dataclass(frozen=True)
+class PairingResult(Sequence[Observation]):
+    """Paired observations and stable, machine-readable rejection totals."""
+
+    observations: tuple[Observation, ...]
+    exclusion_counts: dict[str, int]
+
+    def __getitem__(self, index):
+        return self.observations[index]
+
+    def __len__(self) -> int:
+        return len(self.observations)
+
+    def __iter__(self) -> Iterator[Observation]:
+        return iter(self.observations)
 
 
 def load_ticks(path: Path = LOG_FILE) -> list[dict]:
@@ -39,7 +101,7 @@ def load_ticks(path: Path = LOG_FILE) -> list[dict]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            rows.append(row)
+            rows.append(classify_loaded_record(row))
     return rows
 
 
@@ -64,33 +126,118 @@ def pair_observations(
     symbol: str | None,
     horizon_seconds: float,
     neutral_bps: float,
-    include_mock: bool = False,
-) -> list[Observation]:
-    rows = [r for r in ticks if r.get("mid") is not None and r.get("ts") is not None]
-    if symbol:
-        rows = [r for r in rows if str(r.get("symbol", "")).upper() == symbol.upper()]
+    max_label_lag_seconds: float = 5.0,
+    max_provider_age_seconds: float = 5.0,
+    simulation_only: bool = False,
+    run_id: str | None = None,
+    data_source: str | None = None,
+    provider_route: str | None = None,
+    provider_model: str | None = None,
+    strategy_config_digest: str | None = None,
+) -> PairingResult:
+    """Pair schema-v3 forecasts with a compatible future pricing observation.
+
+    Real and simulated evidence are deliberately disjoint.  Each label must have
+    the forecast's complete declared cohort identity; a merely nearby price from a
+    different run, source, provider, model, or configuration is not a label.
+    """
+    if horizon_seconds <= 0 or max_label_lag_seconds < 0 or max_provider_age_seconds < 0:
+        raise ValueError("horizon must be positive and age/lag limits non-negative")
+    selectors = {
+        "run_id": run_id, "data_source": data_source, "provider_route": provider_route,
+        "provider_model": provider_model, "strategy_config_digest": strategy_config_digest,
+    }
+    counts: Counter[str] = Counter()
+    prepared: list[dict] = []
+    for original in ticks:
+        row = classify_loaded_record(original) if "cohort_eligible" not in original else original
+        if not row.get("cohort_eligible", False):
+            counts["legacy_schema"] += 1
+            continue
+        if symbol and str(row.get("symbol", "")).upper() != symbol.upper():
+            continue
+        if any(value is not None and row.get(key) != value for key, value in selectors.items()):
+            counts["cohort_mismatch"] += 1
+            continue
+        is_simulation = row.get("runtime_mode") == "simulation"
+        is_mock = str(row.get("route") or row.get("provider_route") or "").upper() == "MOCK"
+        if simulation_only != (is_simulation or is_mock):
+            counts["source_mismatch"] += 1
+            continue
+        prepared.append(row)
+
+    forecast_cohorts = {
+        tuple(row.get(field) for field in COHORT_FIELDS)
+        for row in prepared if _valid_probs(row.get("direction_probabilities")) is not None
+    }
+    if len(forecast_cohorts) > 1:
+        raise ValueError("multiple incompatible forecast cohorts; use cohort CLI selectors")
+
     groups: dict[str, list[dict]] = {}
-    for row in rows:
-        groups.setdefault(str(row.get("symbol") or ""), []).append(row)
+    for row in prepared:
+        groups.setdefault(str(row.get("symbol") or "").upper(), []).append(row)
 
     observations: list[Observation] = []
     for group_rows in groups.values():
-        group_rows.sort(key=lambda r: float(r["ts"]))
-        j = 0
-        for i, row in enumerate(group_rows):
+        timed_rows: list[dict] = []
+        for row in group_rows:
+            try:
+                ts = float(row["ts"])
+            except (KeyError, TypeError, ValueError):
+                if (_valid_probs(row.get("direction_probabilities")) is not None
+                        or row.get("mid") is not None):
+                    counts["missing_timestamps"] += 1
+                continue
+            if not math.isfinite(ts):
+                if (_valid_probs(row.get("direction_probabilities")) is not None
+                        or row.get("mid") is not None):
+                    counts["missing_timestamps"] += 1
+                continue
+            timed_rows.append(row)
+        timed_rows.sort(key=lambda r: float(r["ts"]))
+        for i, row in enumerate(timed_rows):
             probs = _valid_probs(row.get("direction_probabilities"))
-            if probs is None:
+            if probs is None or row.get("mid") is None:
                 continue
-            if not include_mock and str(row.get("route") or "").upper() == "MOCK":
-                continue
-            target_ts = float(row["ts"]) + horizon_seconds
-            j = max(j, i + 1)
-            while j < len(group_rows) and float(group_rows[j]["ts"]) < target_ts:
-                j += 1
-            if j >= len(group_rows):
+            forecast_ts = float(row["ts"])
+            target_ts = forecast_ts + horizon_seconds
+            label = None
+            for candidate in timed_rows[i + 1:]:
+                candidate_ts = float(candidate["ts"])
+                if candidate_ts < target_ts or candidate.get("mid") is None:
+                    continue
+                lag = candidate_ts - target_ts
+                if lag > max_label_lag_seconds:
+                    counts["excessive_lag"] += 1
+                    break
+                if candidate.get("data_source") != row.get("data_source"):
+                    counts["source_mismatch"] += 1
+                    continue
+                if any(candidate.get(field) != row.get(field) for field in COHORT_FIELDS):
+                    counts["cohort_mismatch"] += 1
+                    continue
+                if not simulation_only:
+                    if candidate.get("runtime_mode") not in {"dry-real", "paper-real"} or candidate.get("data_source") not in REAL_PRICING_SOURCES:
+                        counts["source_mismatch"] += 1
+                        continue
+                    try:
+                        provider_ts = float(candidate["quote_provider_ts"])
+                    except (KeyError, TypeError, ValueError):
+                        counts["missing_timestamps"] += 1
+                        continue
+                    age = candidate_ts - provider_ts
+                    if not math.isfinite(provider_ts) or age < 0:
+                        counts["missing_timestamps"] += 1
+                        continue
+                    if age > max_provider_age_seconds:
+                        counts["stale_label"] += 1
+                        continue
+                label = candidate
                 break
+            if label is None:
+                continue
             start = float(row["mid"])
-            end = float(group_rows[j]["mid"])
+            end = float(label["mid"])
             if start <= 0:
                 continue
             return_bps = (end / start - 1.0) * 10_000
@@ -100,9 +247,13 @@ def pair_observations(
                 outcome = "down"
             else:
                 outcome = "neutral"
-            observations.append(Observation(probs, outcome, float(row["ts"])))
+            observations.append(Observation(
+                probs, outcome, forecast_ts, str(row["symbol"]),
+                CohortIdentity(*(str(row[field]) for field in COHORT_FIELDS)), horizon_seconds,
+                float(label["ts"]) - forecast_ts,
+            ))
     observations.sort(key=lambda obs: obs.ts)
-    return observations
+    return PairingResult(tuple(observations), {reason: counts[reason] for reason in EXCLUSION_REASONS})
 
 
 def multiclass_brier(observations: list[Observation]) -> float:
@@ -135,7 +286,10 @@ def sample_climatology(observations: list[Observation]) -> dict[str, float]:
 
 
 def constant_forecast_brier(observations: list[Observation], probs: dict[str, float]) -> float:
-    synthetic = [Observation(probs, obs.outcome, obs.ts) for obs in observations]
+    synthetic = [
+        Observation(probs, obs.outcome, obs.ts, obs.symbol, obs.cohort_identity)
+        for obs in observations
+    ]
     return multiclass_brier(synthetic)
 
 
@@ -212,7 +366,15 @@ def _default_block_size(n: int) -> int:
 def moving_block_brier_ci(
     observations: list[Observation], *, block_size: int, draws: int = 1000, seed: int = 17
 ) -> tuple[float, float] | None:
-    """Approximate 95% CI using a moving-block bootstrap for serial dependence."""
+    """Approximate 95% CI for one symbol/cohort using a moving-block bootstrap."""
+    symbols = {obs.symbol for obs in observations}
+    if not symbols or "" in symbols:
+        raise ValueError("moving-block bootstrap requires non-empty observations with a symbol")
+    if len(symbols) != 1:
+        raise ValueError("moving-block bootstrap requires observations from exactly one symbol")
+    cohorts = {obs.cohort_identity for obs in observations}
+    if len(cohorts) != 1:
+        raise ValueError("moving-block bootstrap requires observations from exactly one cohort")
     n = len(observations)
     if block_size < 1:
         raise ValueError("block_size must be positive")
@@ -232,7 +394,8 @@ def moving_block_brier_ci(
 
 
 def summarize(
-    observations: list[Observation], *, block_size: int | None = None, bootstrap_draws: int = 1000
+    observations: list[Observation], *, block_size: int | None = None, bootstrap_draws: int = 1000,
+    selected_symbol: str | None = None,
 ) -> dict:
     brier = multiclass_brier(observations)
     uniform_probs = {k: 1.0 / len(CLASSES) for k in CLASSES}
@@ -246,11 +409,41 @@ def summarize(
     resolved_block = block_size if block_size is not None else _default_block_size(len(observations))
     if resolved_block <= 0:
         raise ValueError("block_size must be positive")
-    ci = moving_block_brier_ci(observations, block_size=resolved_block, draws=bootstrap_draws)
+    symbols = {obs.symbol for obs in observations}
+    cohorts = {obs.cohort_identity for obs in observations}
+    bootstrap_requested = bootstrap_draws > 0
+    if bootstrap_requested and not selected_symbol:
+        raise ValueError("selected_symbol is required for moving-block confidence intervals")
+    if selected_symbol and symbols and symbols != {selected_symbol.strip().upper()}:
+        raise ValueError("selected_symbol does not match every observation")
+    ci = (moving_block_brier_ci(observations, block_size=resolved_block, draws=bootstrap_draws)
+          if bootstrap_requested else None)
     sensitivity: dict[str, list[float] | None] = {}
-    for candidate in sorted({max(1, resolved_block // 2), resolved_block, resolved_block * 2}):
-        candidate_ci = moving_block_brier_ci(observations, block_size=candidate, draws=bootstrap_draws)
-        sensitivity[str(candidate)] = list(candidate_ci) if candidate_ci else None
+    if bootstrap_requested:
+        for candidate in sorted({max(1, resolved_block // 2), resolved_block, resolved_block * 2}):
+            candidate_ci = moving_block_brier_ci(
+                observations, block_size=candidate, draws=bootstrap_draws
+            )
+            sensitivity[str(candidate)] = list(candidate_ci) if candidate_ci else None
+
+    cohort_metadata = None
+    if len(cohorts) == 1:
+        cohort = next(iter(cohorts))
+        cohort_metadata = {field: getattr(cohort, field) for field in COHORT_FIELDS}
+    interval_metadata = {
+        "status": "reported" if ci else "omitted",
+        "omission_reason": (None if ci else
+                            "bootstrap disabled" if not bootstrap_requested else
+                            "insufficient observations for requested block sizes"),
+        "selected_symbol": selected_symbol.strip().upper() if selected_symbol else None,
+        "cohort_identity": cohort_metadata,
+        "block_size": resolved_block,
+        "block_size_method": ("explicit" if block_size is not None
+                              else "n^(1/3) transparent heuristic"),
+        "sensitivity_values": sensitivity,
+        "observation_count": len(observations),
+        "draws": bootstrap_draws,
+    }
 
     support_warnings: list[str] = []
     if len(observations) < 100:
@@ -273,6 +466,7 @@ def summarize(
         "bootstrap_block_size": resolved_block,
         "bootstrap_block_size_method": "explicit" if block_size is not None else "n^(1/3) transparent heuristic",
         "bootstrap_block_sensitivity": sensitivity,
+        "moving_block_interval_metadata": interval_metadata,
         "negative_log_loss": negative_log_loss(observations),
         "accuracy": accuracy(observations),
         "top_label_equal_width_ece": top_ece,
@@ -290,32 +484,66 @@ def summarize(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jev-loop calibrate")
-    parser.add_argument("--symbol")
-    parser.add_argument("--horizon-seconds", type=float, default=15.0)
+    parser.add_argument("--symbol", help="restrict evidence to one symbol")
+    parser.add_argument("--horizon-seconds", type=float, default=15.0,
+                        help="requested forecast horizon (labels are taken at or after it)")
     parser.add_argument("--neutral-bps", type=float, default=1.0)
-    parser.add_argument("--include-mock", action="store_true")
+    parser.add_argument("--max-label-lag-seconds", type=float, default=5.0,
+                        help="maximum delay after the requested horizon (inclusive)")
+    parser.add_argument("--max-provider-age-seconds", type=float, default=5.0,
+                        help="maximum real-label quote age at logging time (inclusive)")
+    parser.add_argument("--simulation-only", action="store_true",
+                        help="analyze only simulation/mock evidence; never mix it with real evidence")
+    parser.add_argument("--run-id", help="select exactly one evidence run")
+    parser.add_argument("--data-source", help="select exactly one declared data source")
+    parser.add_argument("--provider-route", help="select exactly one forecast provider route")
+    parser.add_argument("--provider-model", help="select exactly one forecast provider model")
+    parser.add_argument("--strategy-config-digest", help="select exactly one strategy configuration")
     parser.add_argument("--block-size", type=int, default=None, help="moving-block length; default reports an n^(1/3) heuristic plus sensitivity")
     parser.add_argument("--bootstrap-draws", type=int, default=1000)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    if args.horizon_seconds <= 0 or args.neutral_bps < 0:
-        parser.error("horizon must be positive and neutral band non-negative")
+    if (args.horizon_seconds <= 0 or args.neutral_bps < 0
+            or args.max_label_lag_seconds < 0 or args.max_provider_age_seconds < 0):
+        parser.error("horizon must be positive and neutral band/age/lag limits non-negative")
     if args.block_size is not None and args.block_size <= 0:
         parser.error("block size must be positive")
+    if args.bootstrap_draws < 0:
+        parser.error("bootstrap draws must be non-negative")
+    if args.bootstrap_draws > 0 and not args.symbol:
+        parser.error("--symbol is required when moving-block confidence intervals are requested; "
+                     "use --bootstrap-draws 0 for multi-symbol descriptive metrics")
 
     ticks = load_ticks()
-    observations = pair_observations(
-        ticks,
-        symbol=args.symbol,
-        horizon_seconds=args.horizon_seconds,
-        neutral_bps=args.neutral_bps,
-        include_mock=args.include_mock,
-    )
+    try:
+        pairing = pair_observations(
+            ticks, symbol=args.symbol, horizon_seconds=args.horizon_seconds,
+            neutral_bps=args.neutral_bps, max_label_lag_seconds=args.max_label_lag_seconds,
+            max_provider_age_seconds=args.max_provider_age_seconds,
+            simulation_only=args.simulation_only, run_id=args.run_id,
+            data_source=args.data_source, provider_route=args.provider_route,
+            provider_model=args.provider_model,
+            strategy_config_digest=args.strategy_config_digest,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    observations = list(pairing)
     if not observations:
-        print("no eligible real-provider direction probability observations")
+        print("no eligible direction probability observations; exclusions="
+              + json.dumps(pairing.exclusion_counts, sort_keys=True))
         return 2
-    report = summarize(observations, block_size=args.block_size, bootstrap_draws=args.bootstrap_draws)
-    report.update({"horizon_seconds": args.horizon_seconds, "neutral_bps": args.neutral_bps, "symbol": args.symbol})
+    report = summarize(
+        observations, block_size=args.block_size, bootstrap_draws=args.bootstrap_draws,
+        selected_symbol=args.symbol,
+    )
+    report.update({
+        "requested_horizon_seconds": args.horizon_seconds,
+        "max_label_lag_seconds": args.max_label_lag_seconds,
+        "max_provider_age_seconds": args.max_provider_age_seconds,
+        "neutral_bps": args.neutral_bps, "symbol": args.symbol,
+        "simulation_only": args.simulation_only,
+        "exclusion_counts": pairing.exclusion_counts,
+    })
     if args.json:
         print(json.dumps(report, indent=2, allow_nan=False))
     else:
@@ -331,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
             lo, hi = report["brier_95pct_moving_block_bootstrap_ci"]
             print(f"Brier 95% moving-block bootstrap CI: [{lo:.4f}, {hi:.4f}] (block={report['bootstrap_block_size']})")
         print("outcomes:", report["outcome_counts"])
+        print("exclusions:", report["exclusion_counts"])
         for warning in report["support_warnings"]:
             print(f"support warning: {warning}")
         print("interpretation:", report["interpretation"])

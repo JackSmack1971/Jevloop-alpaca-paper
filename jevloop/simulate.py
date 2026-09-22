@@ -12,10 +12,10 @@ from pathlib import Path
 from .assets import classify_symbol
 from .battery import run_battery
 from .client import MockDecisionClient
-from .ladder import select_rung
 from .limits import Limits
-from .policy import compose_action
+from .reducer import TickIdentity, TickInput, reduce_tick
 from .state import RuntimeState, TradeTick, build_snapshot, observe_trades
+from .evidence import EvidenceContext, serialize_record
 
 LOG_DIR = Path(os.getenv("JEV_LOOP_HOME", str(Path.home() / ".jev-loop")))
 LOG_FILE = LOG_DIR / "log.jsonl"
@@ -37,6 +37,10 @@ def main(argv: list[str] | None = None) -> int:
     hint = classify_symbol(args.symbol)
     rng = random.Random(args.seed)
     client = MockDecisionClient(seed=args.seed)
+    evidence = EvidenceContext.create(
+        runtime_mode="simulation", data_source="seeded-synthetic", symbol=hint.symbol,
+        route=client.name, model=client.model, limits=limits,
+    )
     runtime = RuntimeState(account_equity_usd=10_000.0, last_equity_usd=10_000.0, high_water_mark_usd=10_000.0)
     trades: list[TradeTick] = []
     records: list[dict] = []
@@ -66,22 +70,28 @@ def main(argv: list[str] | None = None) -> int:
             trades=trades,
             runtime=runtime,
             market_data_ts=ts,
+            trade_data_ts=ts,
             max_position_usd=limits.max_position_usd,
             has_depth=hint.has_depth,
         )
+        decision_started_at = time.time()
+        decision_started_monotonic = time.monotonic()
         answers, meta = run_battery(client, snapshot, timeout=1.0)
-        action = compose_action(answers, snapshot, limits)
-        rung = select_rung(
-            risk_kill=False,
-            decision_late=False,
-            jev_down=False,
-            decision_confidence=answers["quote_environment"]["confidence"],
-            low_confidence_threshold=limits.low_confidence_threshold,
-            execution_health_score=answers["execution_health"]["score"],
-            execution_health_floor=limits.execution_health_floor,
+        decision_completed_at = time.time()
+        decision_latency_monotonic_ms = round(
+            (time.monotonic() - decision_started_monotonic) * 1000, 3
         )
+        decision = reduce_tick(TickInput(
+            identity=TickIdentity(
+                run_id=evidence.run_id, runtime_mode="simulation", data_source=evidence.data_source,
+                symbol=evidence.symbol, provider_route=meta["route"], provider_model=meta["model"],
+            ),
+            snapshot=snapshot, answers=answers, asset=hint, limits=limits,
+            decision_latency_ms=meta["latency_ms"],
+        ))
+        action, rung = decision.action, decision.rung
         record = {
-            "schema_version": 2,
+            **evidence.fields(),
             "tick": i + 1,
             "ts": ts,
             "symbol": hint.symbol,
@@ -104,9 +114,31 @@ def main(argv: list[str] | None = None) -> int:
             "action_reason": action.reason,
             "rung": rung.value,
             "execution": "simulation-no-broker",
+            "intentions": [
+                {"kind": effect.intent.kind, "side": effect.intent.side,
+                 "quantity": effect.intent.quantity, "limit_price": effect.intent.limit_price,
+                 "risk_ok": effect.risk.ok, "risk_veto": effect.risk.veto}
+                for effect in decision.effects
+            ],
+            "order_decisions": [
+                {"side": order.side, "quantity": order.quantity,
+                 "limit_price": order.limit_price, "risk_ok": order.risk.ok,
+                 "risk_veto": order.risk.veto}
+                for order in decision.order_decisions
+            ],
             "latency_ms": meta["latency_ms"],
             "route": meta["route"],
             "model": meta["model"],
+            "provider_route": meta["route"],
+            "provider_model": meta["model"],
+            "quote_provider_ts": snapshot["quote_provider_ts"],
+            "trade_provider_ts": snapshot["trade_provider_ts"],
+            "quote_data_age_s": snapshot["data_age_s"],
+            "trade_data_age_s": snapshot["trade_data_age_s"],
+            "decision_started_at": decision_started_at,
+            "decision_completed_at": decision_completed_at,
+            "decision_latency_monotonic_ms": decision_latency_monotonic_ms,
+            "broker_requests": [],
         }
         records.append(record)
         print(f"sim {i+1}: mid={price:.4f} action={action.kind} rung={rung.value}")
@@ -115,9 +147,9 @@ def main(argv: list[str] | None = None) -> int:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             for row in records:
-                fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+                fh.write(serialize_record(row) + "\n")
         payload = {
-            "schema_version": 2,
+            **evidence.fields(),
             "generated_at": time.time(),
             "symbol": hint.symbol,
             "ticks": records[-120:],

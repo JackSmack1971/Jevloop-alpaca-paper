@@ -10,21 +10,62 @@
 
 It is a seconds-scale engineering/research scaffold, not exchange-grade HFT and not evidence of a profitable strategy.
 
+## Evidence log schema v3
+
+Both `run` and `simulate` write the same validated schema-v3 JSONL envelope. Each
+process has one immutable `run_id`; records identify package/Git versions, runtime
+mode and source, provider route/model, configuration digests, provider timestamps,
+data ages, wall-clock decision bounds, monotonic latency, and sanitized broker
+request correlation. Broker evidence connects Alpaca `X-Request-ID` values to the
+run, client/broker order identifiers, submissions, reconciliation reads,
+cancellation requests, and observed states. Authorization and credential fields are
+rejected by the serializer and are never copied from HTTP request headers.
+
+Older or malformed rows remain readable, but are marked `cohort_eligible=false`
+with a `cohort_exclusion_reason`; calibration excludes them from strict cohorts
+rather than silently mixing incomparable schemas. Existing v2 files do not need an
+in-place migration.
+
 ## Install as a Codex skill
 
-Place this directory at `$HOME/.agents/skills/jev-loop` or `<repo>/.agents/skills/jev-loop`. The bundled `agents/openai.yaml` disables implicit invocation because operational use can create paper-broker side effects; invoke it explicitly with `$jev-loop` when you want the workflow.
+Place this directory at `$HOME/.agents/skills/jev-loop` or `<repo>/.agents/skills/jev-loop`. The bundled `agents/openai.yaml` allows implicit routing to this workflow, but activation grants no broker authority: paper submission still requires explicit user intent, `--paper`, a ready canonical preflight, and permission under the environment policy. You can also invoke it explicitly with `$jev-loop`.
 
 Standalone setup:
 
 ```bash
 cd jev-loop
 cp .env.example .env
-uv sync --group dev
+uv sync --locked --dev
 uv run pytest -q
 uv run python scripts/validate_package.py
 ```
 
-`uv.lock` is intentionally not fabricated in this artifact: dependency resolution was unavailable in the build environment. On a networked development machine, run `uv lock`, review the result, commit it, and use `uv sync --locked` in CI for reproducible installs.
+`uv.lock` records the reviewed Python 3.10+ runtime and development dependency graph.
+After changing `pyproject.toml`, regenerate it with the project's supported `uv` version
+and review the diff. Use `uv lock --check` to detect a stale lock without changing it,
+and use `uv sync --locked --dev` for reproducible development installs.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes and pull requests using Python 3.10, the
+minimum version declared in `pyproject.toml`. No additional Python versions are in
+the matrix because the repository does not currently make an explicit commitment
+to maintain them. The workflow grants only read access to repository contents,
+pins both third-party actions and uv, and does not inject broker or provider
+credentials. Its uv download cache is keyed from `uv.lock`; the cache cannot
+bypass the mandatory locked synchronization and lockfile freshness checks.
+
+CI runs this offline, side-effect-free contract through the locked development
+environment:
+
+```bash
+uv sync --locked --dev
+uv lock --check
+uv run python scripts/validate_package.py
+uv run python -m pytest -q
+uv run ruff check .
+uv run python -m compileall -q jevloop scripts evals tests
+```
 
 ## Safe first run
 
@@ -46,7 +87,11 @@ uv run jev-loop run --ticks 30 --symbol BTC/USD
 uv run jev-loop run --paper --ticks 30 --symbol BTC/USD
 ```
 
-Mock judgments are always no-order and cannot be combined with `--paper`.
+`run --paper` also enforces the canonical preflight before activating paper authority or
+allowing an order submission. This checks the paper endpoint, account and asset status,
+provider configuration, and foreign-session `jevloop-` orders. `doctor` is an independent,
+read-only inspection command which displays the same readiness decision; it is not an
+authorization step. Mock judgments are always no-order and cannot be combined with `--paper`.
 
 ## Runtime safety properties
 
@@ -58,6 +103,7 @@ Mock judgments are always no-order and cannot be combined with `--paper`.
 - Each order uses a unique session `client_order_id`. Ambiguous transport/5xx POST outcomes are looked up by client order ID and are **not** blindly retried.
 - If that lookup is still inconclusive, the run stops fail-closed rather than misclassifying the event as a rejection.
 - Account-wide cancellation is never used. Accepted/submitted orders are never counted as fills.
+- Foreign-session `jevloop-` orders block paper preflight and are reported as structured warnings in dry execution; they are never canceled automatically.
 - Directional market orders remain disabled by default; spot sell quantity cannot exceed broker-reconciled long inventory.
 
 ## Probability diagnostics
@@ -72,6 +118,13 @@ Mock judgments are always no-order and cannot be combined with `--paper`.
 - adaptive classwise ECE with equal-count bins;
 - moving-block-bootstrap Brier uncertainty plus block-length sensitivity;
 - class-support warnings.
+
+Moving-block confidence intervals are a single-series operation: `--symbol` is
+required whenever `--bootstrap-draws` is greater than zero (the default). Use
+`--bootstrap-draws 0` to retain multi-symbol descriptive metrics; that output
+explicitly marks the aggregate interval as omitted rather than pooling symbols.
+The interval metadata records the selected symbol, cohort, block size and
+sensitivity values, and observation count.
 
 The command always labels its result `DESCRIPTIVE_ONLY`. No fixed sample size or single calibration metric becomes a deployment-readiness certificate. Strategy-performance claims require separate temporal/purged out-of-sample analysis, costs/slippage, and selection/multiple-testing controls. See `references/evaluation-methodology.md`.
 
@@ -90,7 +143,7 @@ Open `http://127.0.0.1:8765/`. The server exposes only `latest.json` plus bundle
 ## Package map
 
 - `SKILL.md` — concise Codex workflow and invariants.
-- `agents/openai.yaml` — interface metadata and explicit-invocation policy.
+- `agents/openai.yaml` — interface metadata and implicit-routing policy; runtime gates authorize paper effects separately.
 - `jevloop/` — runtime implementation.
 - `tests/` — deterministic offline regression tests.
 - `references/` — progressive provider, architecture/safety, evaluation, research, and live-boundary detail.
