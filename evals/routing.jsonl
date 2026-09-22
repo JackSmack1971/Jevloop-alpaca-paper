@@ -6,7 +6,7 @@
 {"prompt":"Validate AAPL with Alpaca before a paper run of this repository.","expected":"activate","reason":"unambiguous jev-loop workflow without the skill name","case":"implicit-positive"}
 {"prompt":"Open the local decision-harness dashboard.","expected":"activate","reason":"unambiguous jev-loop workflow without the skill name","case":"implicit-positive"}
 {"prompt":"Audit the seven-question battery in this repository for arithmetic leakage.","expected":"activate","reason":"unambiguous jev-loop workflow without the skill name","case":"implicit-positive"}
-{"prompt":"Tighten this harness's risk gate for projected inventory.","expected":"activate","reason":"unambiguous jev-loop workflow without the skill name","case":"implicit-positive"}
+{"prompt":"Inspect jev-loop's no-live boundary and verify that it has no hidden enablement path.","expected":"activate","reason":"inspection of jev-loop's live boundary is an owned workflow, unlike a generic live-trading request","case":"implicit-positive"}
 {"prompt":"Run the repository's doctor command for ETH/USD.","expected":"activate","reason":"unambiguous jev-loop workflow without the skill name","case":"implicit-positive"}
 {"prompt":"Use $jev-loop to explain the deterministic versus Jev split.","expected":"activate","reason":"explicit jev-loop workflow","case":"explicit-positive"}
 {"prompt":"Use $jev-loop to test session-owned order cancellation.","expected":"activate","reason":"explicit jev-loop workflow","case":"explicit-positive"}

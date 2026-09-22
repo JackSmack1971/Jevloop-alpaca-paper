@@ -5,11 +5,13 @@ These JSONL files are test inputs, not proof of skill quality by themselves.
 For a meaningful Codex evaluation:
 
 1. pin the Codex/model version, repository state, environment, credentials/capabilities, and task inputs;
-2. run repeated paired trials **with** the skill and from the same starting state **without** the skill;
+2. run routing prompts three times with the installed skill, and run task/failure
+   scenarios five times in paired **with skill** and **without skill** conditions;
 3. keep routing evaluation separate from task-success evaluation;
 4. score mechanically observable outcomes where possible (commands, exit codes, diffs, broker-mode selection, forbidden side effects, evidence reporting);
 5. include failure cases such as stale pricing data, ambiguous POST outcome, provider timeout, cancellation uncertainty, and live-trading requests;
-6. report raw counts plus precision/recall for activation, task success, unsafe-side-effect rate, recovery rate, and token/latency cost;
+6. keep explicit runtime activation telemetry separate from behavioral routing, and
+   report command/tool-call counts plus successful-run token, command, and wall-clock ratios;
 7. inspect negative/no-uplift cases instead of averaging them away;
 8. do not treat evaluator agreement or agent confidence as execution evidence.
 
@@ -17,14 +19,33 @@ The strongest safety assertions are also runtime-tested rather than left solely 
 
 ## Opt-in paired runner
 
-`run.py` executes every case repeatedly in both conditions: an unchanged checkout
-(`with_skill`) and the same Git commit with only `SKILL.md` removed
-(`without_skill`). Each trial gets a fresh detached worktree, which is destroyed after
-capture, so edits and generated files cannot reach a later trial. The deterministic
-graders consume Codex JSON events, the final answer, Git diff, and Git status. Routing
-success and task success remain separate in `report.json`; the report also contains
-raw pass/total counts, unsafe-side-effect and recovery rates, latency, token totals,
-and an explicit statement when confidence intervals are not justified.
+`run.py` loads `routing.jsonl`, `tasks.jsonl`, and `failures.jsonl` as distinct suites.
+The protocol is 50 routing scenarios × 3 repetitions in the treatment condition,
+10 tasks × 5 repetitions × 2 conditions, and 5 failures × 5 repetitions × 2
+conditions: exactly **300 planned trials**. Routing is treatment-only because it
+measures whether the installed skill routes correctly; task and failure uplift is
+paired against a baseline from the same commit.
+
+Each trial gets a fresh detached worktree. Treatment worktrees receive the complete
+skill at `.agents/skills/jev-loop/` (`SKILL.md`, `references/`, `scripts/`, and
+`assets/`); that path is absent in baseline worktrees. Every record carries suite,
+scenario, repetition, condition, commit, model, Codex version, installed path, and a
+content digest. An explicit Codex skill-activation event is retained when present;
+otherwise activation telemetry is `inconclusive`. Reference use remains a separately
+named behavioral-routing score and is never promoted to activation evidence.
+
+Before any external run, inspect the deterministic manifest (this neither requires a
+pinned Codex binary nor invokes Codex):
+
+```bash
+python evals/run.py --list
+```
+
+It must report `planned_trials: 300`, split as 150 routing, 100 task, and 50 failure
+trials. Trial summaries include raw grader counts, unsafe-side-effect and recovery
+rates, command/tool-call totals, token and wall-clock totals, and with-skill /
+without-skill successful-run efficiency ratios. A missing baseline (as in routing)
+produces a null ratio rather than a fabricated comparison.
 
 Prerequisites:
 
@@ -50,7 +71,8 @@ handled as sensitive local audit data; publish only reviewed redacted records. T
 environment profile is allowlisted rather than copied from the process environment.
 Both result forms are ignored by Git.
 
-`scripts/validate_package.py` only checks the configuration, case schema, and grader
-contract statically. It does **not** invoke Codex, authenticate, execute trials, or
-claim evaluation results. External evaluation is intentionally absent from the
-ordinary offline test suite.
+`scripts/validate_package.py` mechanically checks all three corpus sizes, canonical
+suite repetitions/conditions, the exact 150/100/50 manifest arithmetic, and the
+grader contract. It does **not** invoke Codex, authenticate, execute trials, or claim
+evaluation results. External evaluation is intentionally absent from the ordinary
+offline test suite.

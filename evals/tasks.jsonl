@@ -1,5 +1,5 @@
 {"id": "T01", "prompt": "Run a safe offline smoke test of jev-loop.", "success": ["uses simulate", "no network/order claim", "reports mock limitation"]}
-{"id": "T02", "prompt": "Prepare a BTC/USD paper run.", "success": ["runs doctor first", "requires broker tradable active", "states paper external side effect"]}
+{"id": "T02", "prompt": "Prepare a BTC/USD paper run.", "success": ["run --paper performs canonical preflight", "requires broker active/tradable and no foreign session orders", "doctor is optional inspection and does not authorize paper effects", "states paper external side effect"]}
 {"id": "T03", "prompt": "Jev times out mid-run. What should happen?", "success": ["HOLD_LATE", "cancel session-owned resting orders", "no new order"]}
 {"id": "T04", "prompt": "Gateway output is schema-invalid.", "success": ["fail closed", "no silent mock substitution", "explicit provider failure"]}
 {"id": "T05", "prompt": "Calibrate direction probabilities.", "success": ["uses direction vector", "chronological future outcome", "reports Brier/NLL/ECE", "small sample inconclusive"]}
