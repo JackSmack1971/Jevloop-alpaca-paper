@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .assets import AssetSpec, quantize_quantity, quantity_for_notional
 from .battery import run_battery
-from .client import DecisionClientError, DecisionSchemaError
+from .client import DecisionClientError, DecisionLateResponseError, DecisionSchemaError
 from .execution.alpaca import (
     TERMINAL_ORDER_STATES,
     AlpacaAPIError,
@@ -525,18 +525,30 @@ def run(
             elapsed = time.monotonic() - tick_start
             timeout = max(0.05, limits.tick_seconds - elapsed - 0.15)
             answers = None
-            meta = {"route": None, "model": None, "latency_ms": None}
+            meta = {
+                "route": None, "model": None, "latency_ms": None,
+                "decision_deadline_s": timeout,
+                "decision_transport_latency_ms": None,
+                "late_response_disposition": None,
+            }
             decision_late = False
             jev_down = False
             decision_started_at = time.time()
             decision_started_monotonic = time.monotonic()
             try:
-                answers, meta = run_battery(decision_client, snapshot, timeout=timeout)
+                answers, response_meta = run_battery(decision_client, snapshot, timeout=timeout)
+                meta.update(response_meta)
                 runtime.recent_latencies_ms.append(float(meta["latency_ms"]))
                 runtime.recent_latencies_ms = runtime.recent_latencies_ms[-10:]
+            except DecisionLateResponseError as exc:
+                decision_late = True
+                meta["decision_deadline_s"] = exc.configured_deadline_s
+                meta["decision_transport_latency_ms"] = exc.measured_latency_ms
+                meta["latency_ms"] = exc.measured_latency_ms
+                meta["late_response_disposition"] = exc.disposition
+                print(f"tick {block}: decision unavailable: {exc}")
             except (DecisionClientError, DecisionSchemaError) as exc:
-                decision_late = "deadline" in str(exc).lower()
-                jev_down = not decision_late
+                jev_down = True
                 print(f"tick {block}: decision unavailable: {exc}")
             finally:
                 meta["decision_started_at"] = decision_started_at
@@ -544,6 +556,12 @@ def run(
                 meta["decision_latency_monotonic_ms"] = round(
                     (time.monotonic() - decision_started_monotonic) * 1000, 3
                 )
+                if meta["decision_transport_latency_ms"] is None:
+                    meta["decision_transport_latency_ms"] = meta["decision_latency_monotonic_ms"]
+                if meta["late_response_disposition"] is None:
+                    meta["late_response_disposition"] = (
+                        "accepted_on_time" if answers is not None else "no_response"
+                    )
 
             action = None if decision_late else (fallback_action(snapshot, limits) if jev_down or answers is None else compose_action(answers, snapshot, limits))
             hard = risk_check(
@@ -709,6 +727,9 @@ def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, 
         "decision_started_at": meta.get("decision_started_at") if meta else None,
         "decision_completed_at": meta.get("decision_completed_at") if meta else None,
         "decision_latency_monotonic_ms": meta.get("decision_latency_monotonic_ms") if meta else None,
+        "decision_deadline_s": meta.get("decision_deadline_s") if meta else None,
+        "decision_transport_latency_ms": meta.get("decision_transport_latency_ms") if meta else None,
+        "late_response_disposition": meta.get("late_response_disposition") if meta else None,
     }
     if _ACTIVE_EVIDENCE:
         record.update(_ACTIVE_EVIDENCE.fields())

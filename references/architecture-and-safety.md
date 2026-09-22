@@ -48,6 +48,12 @@ Pricing and flow timestamps are distinct:
 
 The package currently polls REST endpoints. Alpaca's websocket market-data and `trade_updates` streams are a better future path for event-driven state/reconciliation, but adopting them requires explicit ordering/reconnect/backfill tests rather than assuming streaming is automatically correct.
 
+Decision deadlines are total monotonic budgets across connection attempts, reads,
+retries, and backoff. Requests cannot provide exact wall-clock interruption; a
+response returned after the budget is rejected and routed to `HOLD_LATE`. A truly
+cancellable transport remains a separate architecture decision if strict interruption
+is later required.
+
 ## Pricing
 
 Default pricing is unit-transparent: remain passive relative to observed top of book, add a bounded buffer/widening factor, and apply inventory-utilization skew. The Avellaneda–Stoikov helper remains research-only because its venue-specific parameters and units require empirical estimation rather than arbitrary defaults.
