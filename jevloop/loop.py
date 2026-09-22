@@ -12,6 +12,8 @@ import os
 import signal
 import sys
 import time
+import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 from .assets import AssetSpec, quantize_quantity, quantity_for_notional
@@ -91,26 +93,81 @@ def _owned_open_orders(alpaca) -> list[dict]:
     return [o for o in alpaca.get_open_orders() if alpaca.is_owned_order(o, alpaca.session_id)]
 
 
+@dataclass(frozen=True)
+class ReconciliationResult:
+    """Evidence from one ownership-scoped cancellation and broker verification."""
+
+    cancelled: int
+    cancel_error: str | None
+    verification_error: str | None
+    unresolved_orders: tuple[dict[str, str | None], ...]
+
+    @property
+    def verified(self) -> bool:
+        return self.verification_error is None and not self.unresolved_orders
+
+    def as_dict(self) -> dict:
+        return {
+            "cancelled": self.cancelled,
+            "cancel_error": self.cancel_error,
+            "verification_error": self.verification_error,
+            "verified": self.verified,
+            "unresolved_orders": list(self.unresolved_orders),
+        }
+
+
+def _reconcile_session_orders(alpaca, *, dry: bool, verify_attempts: int = 3) -> ReconciliationResult:
+    """Cancel only current-session orders, then independently verify broker state."""
+    if dry:
+        return ReconciliationResult(0, None, None, ())
+
+    cancelled = 0
+    cancel_error = None
+    try:
+        cancelled = len(alpaca.cancel_session_orders())
+    except BaseException as exc:  # Cleanup must never replace the failure being handled.
+        cancel_error = f"{type(exc).__name__}: {exc}"
+
+    remaining: list[dict] = []
+    verification_error = None
+    for attempt in range(max(1, verify_attempts)):
+        try:
+            remaining = _owned_open_orders(alpaca)
+        except BaseException as exc:  # Verification failure is distinct from cancellation failure.
+            verification_error = f"{type(exc).__name__}: {exc}"
+            break
+        if not remaining:
+            break
+        if attempt + 1 < verify_attempts:
+            time.sleep(0.1)
+
+    identities = tuple(
+        {
+            "id": str(order.get("id")) if order.get("id") is not None else None,
+            "client_order_id": (
+                str(order.get("client_order_id")) if order.get("client_order_id") is not None else None
+            ),
+        }
+        for order in remaining
+    )
+    return ReconciliationResult(cancelled, cancel_error, verification_error, identities)
+
+
 def _cancel_owned(alpaca, *, dry: bool, verify_attempts: int = 3) -> tuple[int, str | None]:
     """Cancel this session's orders and verify no owned open order remains.
 
     A cancellation request is not treated as a completed cancellation. Requoting and
     emergency flattening are blocked when broker reconciliation is incomplete.
     """
-    if dry:
-        return 0, None
-    try:
-        cancelled = alpaca.cancel_session_orders()
-        for attempt in range(max(1, verify_attempts)):
-            remaining = _owned_open_orders(alpaca)
-            if not remaining:
-                return len(cancelled), None
-            if attempt + 1 < verify_attempts:
-                time.sleep(0.1)
-        ids = [str(order.get("id")) for order in remaining if order.get("id")]
-        return len(cancelled), f"owned orders still open after cancellation: {ids}"
-    except AlpacaAPIError as exc:
-        return 0, str(exc)
+    result = _reconcile_session_orders(alpaca, dry=dry, verify_attempts=verify_attempts)
+    errors = []
+    if result.cancel_error:
+        errors.append(f"cancellation failed: {result.cancel_error}")
+    if result.verification_error:
+        errors.append(f"verification failed: {result.verification_error}")
+    if result.unresolved_orders:
+        errors.append(f"owned orders still open after cancellation: {list(result.unresolved_orders)}")
+    return result.cancelled, "; ".join(errors) or None
 
 
 def _refresh_order_statuses(alpaca, runtime: RuntimeState, pending_orders: dict[str, dict]) -> None:
@@ -344,6 +401,11 @@ def run(
     except (ValueError, AttributeError, OSError):
         pass
 
+    # PAPER AUTHORITY ACTIVATION POINT: after preflight and dependency validation,
+    # immediately before entering the abnormal-exit boundary. From this statement
+    # onward the loop may mutate the paper account, and every abnormal exit is
+    # ownership-scoped, broker-verified, and durably evidenced.
+    paper_authority_active = not dry_execution
     try:
         while ticks is None or n < ticks:
             tick_start = time.monotonic()
@@ -550,13 +612,45 @@ def run(
                 return 3 if runtime.inventory_qty != 0 and not dry_execution else 0
             _sleep_remaining(tick_start, limits.tick_seconds)
         return 0
-    except (KeyboardInterrupt, _StopRequested):
-        count, error = _cancel_owned(alpaca, dry=dry_execution)
-        print(f"stopping; canceled {count} session-owned order(s)" + (f"; error={error}" if error else ""))
-        return 0
+    except (KeyboardInterrupt, _StopRequested) as exc:
+        reconciliation = _reconcile_session_orders(alpaca, dry=dry_execution)
+        _append_reconciliation_record(
+            kind="stop",
+            original_failure=exc,
+            failure_traceback=traceback.format_exc(),
+            reconciliation=reconciliation,
+            paper_authority_active=paper_authority_active,
+            symbol=spec.symbol,
+        )
+        print(
+            f"stopping; canceled {reconciliation.cancelled} session-owned order(s); "
+            f"verified={reconciliation.verified}"
+        )
+        return 0 if reconciliation.verified else 3
+    except Exception as exc:
+        # Bare `raise` below retains the original exception object and traceback.
+        # Cleanup and evidence failures are attached as notes rather than replacing it.
+        original_traceback = traceback.format_exc()
+        reconciliation = _reconcile_session_orders(alpaca, dry=dry_execution)
+        try:
+            _append_reconciliation_record(
+                kind="unexpected_failure",
+                original_failure=exc,
+                failure_traceback=original_traceback,
+                reconciliation=reconciliation,
+                paper_authority_active=paper_authority_active,
+                symbol=spec.symbol,
+            )
+        except BaseException as evidence_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"failed to durably record reconciliation evidence: {evidence_exc!r}")
+        raise
     finally:
         if previous_sigterm is not None:
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except (ValueError, AttributeError, OSError):
+                pass
 
 
 def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, runtime, action_name=None):
@@ -589,6 +683,34 @@ def _record(block, now, spec, snapshot, answers, meta, action, rung, execution, 
         "route": meta.get("route") if meta else None,
         "model": meta.get("model") if meta else None,
     }
+
+
+def _append_reconciliation_record(
+    *,
+    kind: str,
+    original_failure: BaseException,
+    failure_traceback: str,
+    reconciliation: ReconciliationResult,
+    paper_authority_active: bool,
+    symbol: str,
+) -> None:
+    """Durably append abnormal-exit evidence without using replaceable latest state."""
+    _append_log(
+        {
+            "schema_version": 2,
+            "event": "paper_reconciliation",
+            "kind": kind,
+            "ts": time.time(),
+            "symbol": symbol,
+            "paper_authority_active": paper_authority_active,
+            "original_failure": {
+                "type": type(original_failure).__name__,
+                "message": str(original_failure),
+                "traceback": failure_traceback,
+            },
+            "cleanup": reconciliation.as_dict(),
+        }
+    )
 
 
 def _append_log(record: dict) -> None:
